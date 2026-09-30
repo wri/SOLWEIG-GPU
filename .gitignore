@@ -14,3 +14,6 @@ docs/_build/
 
 # Files staged for deletion (review and delete this folder manually)
 _to_delete/
+
+# Benchmark working files and results
+bench_runs/
