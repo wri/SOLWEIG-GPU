@@ -54,6 +54,37 @@ uv run --with "gdal==$(gdal-config --version)" bench/bench.py --download \
     --start "2020-08-13 12:00:00" --end "2020-08-13 15:00:00" --label smoke
 ```
 
+## Running on EC2 with Coiled
+
+Build the software environment once (conda-forge PyTorch with CUDA, GDAL, etc.; it also
+works on CPU-only instances):
+
+```bash
+uvx coiled env create --workspace wri-cities-data --name solweig-bench \
+    --conda bench/coiled-env.yml --gpu-enabled
+```
+
+Then run the benchmark on one or more instance types. Each gets its own VM, they run in
+parallel, and each VM shuts down when its run finishes:
+
+```bash
+bench/coiled_bench.sh g4dn.xlarge g6.xlarge c7i.2xlarge -- --crop 1000
+```
+
+Runs go to the `wri-cities-data` workspace (override with `WORKSPACE=...`).
+Arguments after `--` are passed to `bench.py`; `--download` and `--label <vm type>` are
+added automatically. `bench/` and `solweig_gpu/` are uploaded to the VM, so the run uses
+your local checkout. Each VM prints its results JSON to its log, and the script saves it to
+`bench_runs/results/<stamp>_<vm type>.json` (full logs in `bench_runs/logs/`).
+
+Suggested comparisons, each changing one thing:
+
+| Instances                                  | Question                                        |
+|--------------------------------------------|-------------------------------------------------|
+| `c7i.2xlarge` vs `c7i.8xlarge`             | How do the CPU stages scale with cores?         |
+| `g4dn.xlarge` vs `g6.xlarge` vs `g5.xlarge`| T4 vs L4 vs A10G, all with 4 vCPUs              |
+| `g5.xlarge` vs `g5.4xlarge`                | Same GPU, more CPU: do CPU stages hold it back? |
+
 ## Looking inside a stage
 
 The stage timings show *which* stage is slow on a platform; a profiler shows *why*.

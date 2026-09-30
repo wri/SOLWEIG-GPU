@@ -1,0 +1,30 @@
+# Coiled software environment for bench.py. Build once with:
+#   coiled env create --workspace wri-cities-data --name solweig-bench --conda bench/coiled-env.yml --gpu-enabled
+# PyTorch comes from PyPI: its Linux x86_64 wheels bundle CUDA, whereas conda-forge's
+# solver picks the CPU-only build here. The CUDA build also runs on CPU-only VMs.
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - gdal
+  - rasterio
+  - numba
+  - numpy
+  - scipy
+  - pandas
+  - netcdf4
+  - xarray
+  - pytz
+  - shapely
+  - pyproj
+  - timezonefinder
+  - tqdm
+  - matplotlib
+  - psutil
+  # Required by Coiled itself to start the VM's container
+  - coiled
+  - dask
+  - distributed
+  - pip
+  - pip:
+      - torch

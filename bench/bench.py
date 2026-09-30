@@ -44,6 +44,8 @@ INPUT_RASTERS = ["Building_DSM.tif", "DEM.tif", "Trees.tif", "Landcover.tif", "B
 ZENODO = "https://zenodo.org/api/records/21081622/files"
 DEFAULT_INPUT_URL = f"{ZENODO}/Input_rasters.zip/content"
 DEFAULT_ERA5_URL = f"{ZENODO}/ERA-5_forcing_data.zip/content"
+JSON_BEGIN = "===BENCH_JSON_BEGIN==="
+JSON_END = "===BENCH_JSON_END==="
 
 
 def parse_args() -> argparse.Namespace:
@@ -71,6 +73,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--label", default="", help="Free-text label stored in the results, e.g. 'm5-cpu'")
     p.add_argument("--sample-interval", type=float, default=1.0, help="Resource sampling interval in seconds")
     p.add_argument("--keep-work", action="store_true", help="Keep the run's working files (default: delete)")
+    p.add_argument("--print-json", action="store_true",
+                   help="Also print the results (gzipped, base64) to stdout between marker lines, so "
+                        "they can be collected from a remote VM (used by coiled_bench.sh)")
     args = p.parse_args()
     if not args.download and not (args.input_dir and args.era5_dir):
         p.error("give --input-dir and --era5-dir, or --download")
@@ -470,6 +475,17 @@ def main() -> None:
               f"{'' if gpu is None else f'{gpu:.0f}':>7}")
     print(f"  {'total':<14}{total:>10.1f}")
     print(f"[bench] results -> {out_file}")
+    if args.print_json:
+        # gzip + base64 in short lines: `coiled run` re-wraps long output lines and
+        # strips [bracketed] text as markup, which would corrupt raw JSON.
+        import base64
+        import gzip
+        import textwrap
+
+        payload = base64.b64encode(gzip.compress(json.dumps(report, default=str).encode())).decode()
+        print(JSON_BEGIN)
+        print("\n".join(textwrap.wrap(payload, 64)))
+        print(JSON_END)
 
     if not args.keep_work:
         shutil.rmtree(run_dir, ignore_errors=True)
