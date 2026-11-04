@@ -310,7 +310,7 @@ def shadow(amaxvalue, a, vegdem, vegdem2, bush, azimuth, altitude, scale):
     if azimuth == 0.0:
         azimuth = 1e-12
     azimuth = ensure_tensor(azimuth)
-    altitutde = ensure_tensor(altitude)
+    altitude = ensure_tensor(altitude)
     azimuth = azimuth * degrees #torch.tensor(azimuth * degrees, device=a.device)
     altitude = altitude * degrees #torch.tensor(altitude * degrees, device=a.device)
 
@@ -934,7 +934,7 @@ def svf_calculator(patch_option, amaxvalue=None, a=None, vegdem=None, vegdem2=No
                 svfS = svfS + weight
             if 180 <= azimuth < 360:
                 svfW = svfW + weight
-            if 270 <= azimuth < 90:
+            if azimuth >= 270 or azimuth < 90:
                 svfN = svfN + weight
 
             svfveg = svfveg + wf * vegsh
@@ -948,7 +948,7 @@ def svf_calculator(patch_option, amaxvalue=None, a=None, vegdem=None, vegdem2=No
             if 180 <= azimuth < 360:
                 svfWveg = svfWveg + wa * vegsh
                 svfWaveg = svfWaveg + wa * vbshvegsh
-            if 270 <= azimuth < 90:
+            if azimuth >= 270 or azimuth < 90:
                 svfNveg = svfNveg + wa * vegsh
                 svfNaveg = svfNaveg + wa * vbshvegsh
 

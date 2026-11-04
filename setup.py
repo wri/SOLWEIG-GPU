@@ -18,7 +18,7 @@ long_description = (this_directory / "README.md").read_text(encoding="utf-8")
 
 setup(
     name="solweig-gpu",
-    version="1.2.22",
+    version="2.0.0",
     description="GPU-accelerated SOLWEIG model for urban thermal comfort simulation",
     long_description=long_description,
     long_description_content_type='text/markdown',
@@ -41,7 +41,6 @@ setup(
         "timezonefinder",
         "xarray",
         "tqdm",
-        "PyQt5",
         "matplotlib"
     ],
     extras_require={
@@ -66,7 +65,6 @@ setup(
         'console_scripts': [
             'solweig_gpu=solweig_gpu.cli:main',
             'thermal_comfort=solweig_gpu.cli:main',
-            'solweig_gpu_gui=solweig_gpu.solweig_gpu_gui:main',
             'solweig_download_era5=solweig_gpu.download_era5:main',
         ],
     },

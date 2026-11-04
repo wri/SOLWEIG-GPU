@@ -126,6 +126,36 @@ SVF is a geometric parameter that quantifies the openness of a location to the s
 
 By default, building footprints are clipped (see [Building clipping](#building-clipping)): they are NaN in the Shadow output.
 
+### Wet Bulb Globe Temperature (WBGT) — New in Version 2
+
+**Filename:** `WBGT_X_Y.tif`  
+**Format:** Multi-band GeoTIFF  
+**Units:** °C  
+**Description:** The Wet Bulb Globe Temperature, a heat stress index widely used in occupational health and sports medicine. It is computed from the wet bulb temperature, black globe temperature (derived from Tmrt), and air temperature.
+
+**Saved when:** `save_wbgt=True`
+
+### Air Temperature (Ta) — New in Version 2
+
+**Filename:** `Ta_X_Y.tif`  
+**Format:** Multi-band GeoTIFF  
+**Units:** °C  
+**Description:** Diagnostic 2-m air temperature field used in the UTCI/WBGT calculation. When `use_uhi=True` with ERA5 forcing, this includes the diagnostic urban heat island intensity (UHII) adjustment.
+
+**Saved when:** `save_ta=True`
+
+### Wind Speed — New in Version 2
+
+**Filename:** `Wind_X_Y.tif`  
+**Format:** Multi-band GeoTIFF  
+**Units:** m/s  
+**Description:** Diagnostic 10-m wind speed field used in the UTCI calculation. When directional wind-extension coefficients are used (`ERA_5_z0_find=True` or `windcoeff_folder`), the wind field reflects the direction-dependent attenuation by buildings and vegetation.
+
+**Saved when:** `save_wind=True`
+
+!!! note "Urban heat island intensity (UHII)"
+    When `use_uhi=True` with ERA5 forcing, a diagnostic UHII (GLIDE-SOL scheme) is written into the generated metfiles during preprocessing and added to the air temperature in the UTCI/WBGT calculation.
+
 ## Building Clipping
 
 `clip_buildings` (default `True`) controls whether building footprints are set to NaN in the **UTCI** and **Shadow** outputs. A pixel counts as a building where Building DSM − DEM ≥ 2 m; pixels with no DSM/DEM data are treated the same way. Pass `clip_buildings=False` to `thermal_comfort()` or `run_utci_tiles()` (or `--clip_buildings False` on the command line) to keep the rooftop values. The other outputs are never clipped, and the physics is identical either way; only the written values change.

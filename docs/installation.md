@@ -21,8 +21,7 @@ conda create -n solweig python=3.10
 conda activate solweig
 
 # Install dependencies via conda
-conda install -c conda-forge gdal pytorch timezonefinder matplotlib sip 
-pip install PyQt5
+conda install -c conda-forge gdal pytorch timezonefinder matplotlib
 conda install -c conda-forge cudnn #If GPU is available
 
 # Install SOLWEIG-GPU
@@ -31,6 +30,16 @@ pip install solweig-gpu
 # If you have installed an older version
 pip install --upgrade solweig-gpu
 ```
+
+## Optional Dependencies for `build_inputs()`
+
+The Version 2 input-data builder (`build_inputs()`) downloads data via Google Earth Engine and OpenStreetMap and needs additional packages:
+
+```bash
+pip install earthengine-api geemap geopandas osmnx rasterio geopy numba pyproj
+```
+
+You also need a Google Earth Engine project; authenticate once with `earthengine authenticate` and set your project ID in the `EE_PROJECT` environment variable. These packages are not required for regular SOLWEIG-GPU simulations.
 
 ## Using pip with system GDAL
 
