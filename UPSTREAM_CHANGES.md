@@ -5,6 +5,27 @@ SOLWEIG-GPU (baseline copy taken ~2026-06-18). It is written for the upstream
 maintainer: what changed, why, the measured speedups, and the evidence that the
 outputs are unchanged.
 
+**Merged with upstream v2.0.0.** On 2026-11-04 this work was merged with upstream
+`main` at `1fec79a` (v2.0.0, 62 commits after the `38b451d` baseline). Every
+measurement and "unchanged output" claim below was made against `38b451d`; the
+merge was checked with the test suite, not re-measured with the harness. The
+merge changes four things:
+
+- **svfN fix.** Upstream fixed the north test in `svf_calculator`:
+  `270 <= azimuth < 90` is always false, so `svfN`, `svfNveg` and `svfNaveg`
+  stayed 0. The fix is carried into the rewritten accumulation loop (§1.4), so
+  these three rasters now differ from the baseline by design, as they do in
+  v2.0.0. The other `svf*` rasters, the shadow matrices and walls/aspect are
+  unaffected.
+- **Bush-branch slice.** v2.0.0 fixed the off-by-one of §3.6 the same way.
+- **GUI removed.** Upstream deleted `solweig_gpu_gui.py`, and with it the GUI
+  controls for `clip_buildings` and the albedo inputs. Use the Python API or the
+  CLI.
+- **Wind coefficients.** Upstream replaced the single wind-coefficient raster with
+  12 directional rasters (`windcoeff_folder` on `preprocess`; `ERA_5_z0_find` and
+  `build_wind_ext_coeff` on `thermal_comfort`). The stale-folder cleanup of §4
+  removes `WindCoeff/` when no wind coefficients are given.
+
 Three themes:
 
 1. **Performance** — the SVF/shadow-casting and walls/aspect stages were rewritten
@@ -36,8 +57,8 @@ with `patch_option=2` (153 sky patches).
 | Sun time with `hours` | `solweig_gpu/sun_position.py` | the sun is placed half the *native* step (at most 1 h) before each metfile row, not half the gap between the rows that `hours` kept (§3.7) | `hours=[4, 9, 12]` no longer puts the sun 2.5 h early; a kept hour gets the same sun as in a full-day run | contiguous hourly and 30-min metfiles bit-identical; runs with gaps between rows or a single row change (intended) |
 | Land-cover codes on the GPU | `solweig_gpu/utci_process.py` | the solver gets the recoded land cover (trees → grass, invalid → bare soil), not the raw codes (§3.8) | GPU runs no longer treat land-cover code 3 as water; they match CPU runs | unchanged without land cover or without code 3 |
 | ERA-5 downloader | `solweig_gpu/download_era5.py` (new), `setup.py`, `docs/input_data.md` | auto-bbox from the DSM, latest-available-date default, ERA5 & ERA5-Land | one-command forcing download | n/a (new feature) |
-| Building clipping option | `solweig_gpu/utci_process.py`, `solweig_gpu/solweig_gpu.py`, `solweig_gpu/cli.py`, `solweig_gpu/solweig_gpu_gui.py`, docs | `clip_buildings` (default on) NaNs building footprints in UTCI **and Shadow**; outputs tagged `CLIP_BUILDINGS=YES/NO`; resume recomputes tiles written with the other setting (§4) | UTCI unchanged by default; **Shadow gains NaN roofs by default** (was never masked) | clip on: UTCI bit-identical, Shadow bit-identical off buildings; clip off: Shadow bit-identical, UTCI bit-identical off buildings |
-| Albedo inputs | `solweig_gpu/albedo.py` (new), `solweig_gpu/preprocessor.py`, `solweig_gpu/utci_process.py`, `solweig_gpu/solweig_gpu.py`, `solweig_gpu/cli.py`, `solweig_gpu/solweig_gpu_gui.py`, docs | optional ground albedo raster (resampled to the DSM grid), `albedo_walls` / `albedo_ground`, cool-roof air-temperature cut from a baseline albedo raster; UTCI tagged `ALBEDO=...`; resume recomputes tiles written with other albedo settings (§4) | new scenarios: per-pixel albedo, cool-roof runs | defaults bit-identical; a constant-0.15 albedo raster is bit-identical to no raster (`tests/test_albedo.py`, Mumbai tile) |
+| Building clipping option | `solweig_gpu/utci_process.py`, `solweig_gpu/solweig_gpu.py`, `solweig_gpu/cli.py`, docs | `clip_buildings` (default on) NaNs building footprints in UTCI **and Shadow**; outputs tagged `CLIP_BUILDINGS=YES/NO`; resume recomputes tiles written with the other setting (§4) | UTCI unchanged by default; **Shadow gains NaN roofs by default** (was never masked) | clip on: UTCI bit-identical, Shadow bit-identical off buildings; clip off: Shadow bit-identical, UTCI bit-identical off buildings |
+| Albedo inputs | `solweig_gpu/albedo.py` (new), `solweig_gpu/preprocessor.py`, `solweig_gpu/utci_process.py`, `solweig_gpu/solweig_gpu.py`, `solweig_gpu/cli.py`, docs | optional ground albedo raster (resampled to the DSM grid), `albedo_walls` / `albedo_ground`, cool-roof air-temperature cut from a baseline albedo raster; UTCI tagged `ALBEDO=...`; resume recomputes tiles written with other albedo settings (§4) | new scenarios: per-pixel albedo, cool-roof runs | defaults bit-identical; a constant-0.15 albedo raster is bit-identical to no raster (`tests/test_albedo.py`, Mumbai tile) |
 | Tree transmissivity option | `solweig_gpu/utci_process.py`, `solweig_gpu/solweig_gpu.py`, docs | `tree_transmissivity_pct` (default `None`: the temperate season) sets the percent of light, direct and diffuse, that gets through tree canopies on every date; UTCI/Shadow tagged `TREE_TRANSMISSIVITY_PCT=...`; resume recomputes tiles written with another value (§4) | correct tree shade for tropical cities outside 7 Apr – 26 Oct; any canopy density | default bit-identical; `3` bit-identical to trees in leaf all year |
 | OpenUrban land cover | `solweig_gpu/landcover.py` (new), `solweig_gpu/preprocessor.py`, docs | `python -m solweig_gpu.landcover` converts OpenUrban to SOLWEIG codes (CIF mapping); `preprocess` rejects land cover not in SOLWEIG codes and drops stale `Landcover/` / `WindCoeff/` folders (§4) | OpenUrban no longer runs as bare soil everywhere | SOLWEIG-coded land cover unchanged |
 | Verification harness | `tools/ab_harness/` (new, 9 files) | dump / compare / profile current-vs-original | evidence for every claim above | n/a (tooling) |
@@ -248,8 +269,9 @@ two datasets with different derived filter sizes (including `filtersize=9`).
    to -1 and the branch raised `RuntimeError: The expanded size of the tensor (H) must
    match the existing size (0)` on the first tile with `bush.max() > 0` (on a zero-shift
    axis it silently copied only the last row/column). The line now uses the same
-   bounds as its neighbours, i.e. the MATLAB reference. Upstream crashes on the same
-   input; bush-free tiles never execute the branch and are unaffected. Regression
+   bounds as its neighbours, i.e. the MATLAB reference. Upstream crashed on the same
+   input until v2.0.0, which fixed the line the same way; bush-free tiles never
+   execute the branch and are unaffected. Regression
    tests: `tests/test_shadow_bush.py`.
 7. **Sun position when `hours` keeps only some rows (`solweig_gpu/sun_position.py`)**.
    - Forcing rows are averages over the preceding step (ERA5 radiation is the mean
@@ -333,8 +355,9 @@ this workflow (including the ERA5T real-time-lag warning and the ERA5-Land tip).
 ### Staged pipeline example (`run.py`, `processing.py`, `config.toml`)
 
 The local driver was rewritten from a single `thermal_comfort(...)` call to the
-staged API that the package already exports: `download_era5` → `preprocess` →
-`run_walls_aspect` → `calculate_svf` → `run_utci_tiles` → `mosaic_tiles`.
+staged API that the package exports: `download_era5` → `preprocess` →
+`run_walls_aspect` → `calculate_svf` → `run_utci_tiles` → `mosaic_tiles` (new, in
+`solweig_gpu/postprocess.py`).
 
 - **Caching contract**, explained in comments: walls/aspect/SVF are geometry-only.
   They survive under `processed_inputs/{walls,aspect,SVF}` across runs, and are only
@@ -352,8 +375,9 @@ staged API that the package already exports: `download_era5` → `preprocess` �
     mistyped settings.
   - `run.py` runs the pipeline with `config.toml`, or another config file given on
     the command line.
-- `config.toml` contains machine-local paths. Treat these three files as an
-  example, not library code.
+- `config.toml` holds the Mumbai settings; its `base_path` (`data/mumbai/`) is
+  relative to the config file. Treat these three files as an example, not
+  library code.
 
 ### Optional building clipping (`clip_buildings`)
 
@@ -361,7 +385,7 @@ Upstream `compute_utci` always sets building footprints (Building DSM − DEM
 ≥ 2 m, the existing `valid_mask`) to NaN in the UTCI output, with no way to
 keep the rooftop values, and never masks the Shadow output. A new
 `clip_buildings` argument (default `True`) on `compute_utci`, `run_utci_tiles`
-and `thermal_comfort` (CLI `--clip_buildings`, GUI checkbox) now controls the
+and `thermal_comfort` (CLI `--clip_buildings`) now controls the
 mask for **both** UTCI and Shadow:
 
 - `True`: footprints are NaN in UTCI (as before) **and in Shadow (new default
@@ -393,7 +417,7 @@ albedo of 0.2. This matches how WRI's CTCM / cities-heat-resilient-infrastructur
 workflow handles albedo:
 
 - **Albedo raster**: `preprocess(..., albedo_filename=...)`, also on
-  `thermal_comfort`, CLI `--albedo` and the GUI. It takes fractions 0–1 on any
+  `thermal_comfort` and CLI `--albedo`. It takes fractions 0–1 on any
   grid.
   - If the grid differs from the Building DSM, it is resampled bilinearly onto it
     (`albedo_aligned.vrt`), then tiled into `processed_inputs/Albedo/`.
@@ -402,7 +426,7 @@ workflow handles albedo:
   - NaN/nodata pixels keep the land-cover or flat value.
   - Values outside [0, 1] are rejected with a hint to divide percent rasters by 100.
 - **`albedo_walls` / `albedo_ground`** on `compute_utci`, `run_utci_tiles` and
-  `thermal_comfort` (CLI `--albedo_walls` / `--albedo_ground`, GUI fields) replace
+  `thermal_comfort` (CLI `--albedo_walls` / `--albedo_ground`) replace
   the fixed 0.2 / 0.15. The module constants `albedo_b` / `albedo_g` remain the
   defaults.
 - **Cool-roof air-temperature cut**: with `baseline_albedo_filename`, `preprocess`
@@ -622,7 +646,8 @@ code path bit-for-bit — useful for A/B benchmarking or as an escape hatch.
 
 ### API surface
 
-- Package exports (`solweig_gpu/__init__.py`) are **unchanged**.
+- Package exports (`solweig_gpu/__init__.py`): one addition, `mosaic_tiles` (new
+  `solweig_gpu/postprocess.py`).
 - Backward-compatible signature extensions: `run_walls_aspect(preprocess_dir,
   overwrite=False)`, `run_parallel_processing(..., overwrite=False)`,
   `compute_utci(..., clip_buildings=True)`, `run_utci_tiles(..., clip_buildings=True)`,
@@ -637,7 +662,7 @@ code path bit-for-bit — useful for A/B benchmarking or as an escape hatch.
   - CLI flags `--albedo`, `--baseline_albedo`, `--albedo_walls`, `--albedo_ground`.
 - Tree transmissivity: `compute_utci(..., tree_transmissivity_pct=None)`,
   `run_utci_tiles(..., tree_transmissivity_pct=None)`,
-  `thermal_comfort(..., tree_transmissivity_pct=None)` (Python API only; no CLI/GUI flag).
+  `thermal_comfort(..., tree_transmissivity_pct=None)` (Python API only; no CLI flag).
 - Land cover: the new `solweig_gpu.landcover` module (`openurban_to_solweig`,
   `check_landcover_codes`, `OPENURBAN_TO_SOLWEIG`; runnable with `python -m`).
   `preprocess` / `ppr` signatures are unchanged.
@@ -662,9 +687,8 @@ code path bit-for-bit — useful for A/B benchmarking or as an escape hatch.
 
 ### Not part of the proposed change set
 
-`data/` contents, `config.toml`'s machine-local paths, and `.claude/` /
-`.pytest_cache/` working artifacts are local to this fork's development
-environment.
+`data/` contents and the `.claude/` / `.pytest_cache/` working artifacts are
+local to this fork's development environment.
 
 ---
 
