@@ -1,8 +1,10 @@
 #!/usr/bin/env python
 """Prove the SVF cache written by the NEW code loads through the real pipeline
 consumer (utci_process.load_cached_svf_outputs + zip/vsizip readers) and matches
-the in-memory dump bit-for-bit.
-Usage: roundtrip.py <artifacts_dir> <tile_key> <dump_npz>
+the in-memory dump bit-for-bit. Uses this checkout's solweig_gpu.
+Usage: roundtrip.py <artifacts_dir> <tile_key> <dump_npz> <data_dir>
+  artifacts_dir: dump_svf.py --version cur --artifacts output for the same tile
+  data_dir:      the processed_inputs folder the dump was made from
 """
 import os
 import shutil
@@ -11,28 +13,25 @@ import tempfile
 
 import numpy as np
 
-CUR_ROOT = "/home/arsh/wri/code/SOLWEIG-GPU-main"
-DATA = os.path.join(CUR_ROOT, "data/test1/processed_inputs")
+from _common import NAMES, use_version
 
 
 def main():
-    artifacts, key, dump_npz = sys.argv[1], sys.argv[2], sys.argv[3]
-    import solweig_gpu
-    assert "SOLWEIG-GPU-main_1" not in solweig_gpu.__file__
+    if len(sys.argv) != 5:
+        sys.exit(__doc__)
+    artifacts, key, dump_npz, data = sys.argv[1:5]
+    use_version("cur")
     from solweig_gpu.utci_process import load_cached_svf_outputs
 
     with tempfile.TemporaryDirectory() as td:
         os.makedirs(f"{td}/Building_DSM")
         os.makedirs(f"{td}/SVF")
-        shutil.copy(f"{DATA}/Building_DSM/Building_DSM_{key}.tif", f"{td}/Building_DSM/")
+        shutil.copy(f"{data}/Building_DSM/Building_DSM_{key}.tif", f"{td}/Building_DSM/")
         for f in os.listdir(artifacts):
             shutil.copy(os.path.join(artifacts, f), f"{td}/SVF/")
         out = load_cached_svf_outputs(f"{td}/Building_DSM/Building_DSM_{key}.tif", key)
 
     # loader returns the same 19-tuple order as svf_calculator
-    NAMES = ["svf", "svfaveg", "svfE", "svfEaveg", "svfEveg", "svfN", "svfNaveg",
-             "svfNveg", "svfS", "svfSaveg", "svfSveg", "svfveg", "svfW",
-             "svfWaveg", "svfWveg", "vegshmat", "vbshvegshmat", "shmat", "SVFtotal"]
     assert len(out) == len(NAMES), f"loader returned {len(out)} values"
     named = dict(zip(NAMES, out))
 

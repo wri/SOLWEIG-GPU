@@ -1,39 +1,23 @@
 #!/usr/bin/env python
 """Run svf_calculator for one tile with one package version; dump all 19 returned
-arrays (lossless) + timing/meta JSON. Version isolation: 'orig' prepends the
-original repo root to sys.path, which beats the editable-install meta-path finder.
+arrays (lossless) + timing/meta JSON. Version isolation: --version cur imports
+solweig_gpu from this checkout, --version orig from --orig-root (see _common.py).
 """
 import argparse
 import json
 import os
-import sys
 import time
-import zipfile
 
-ORIG_ROOT = "/home/arsh/wri/code/SOLWEIG-GPU-main_1/SOLWEIG-GPU-main"
-CUR_ROOT = "/home/arsh/wri/code/SOLWEIG-GPU-main"
-DEFAULT_DATA = os.path.join(CUR_ROOT, "data/test1/processed_inputs")
-
-# Exact return order of svf_calculator (identical in both versions).
-NAMES = ["svf", "svfaveg", "svfE", "svfEaveg", "svfEveg", "svfN", "svfNaveg",
-         "svfNveg", "svfS", "svfSaveg", "svfSveg", "svfveg", "svfW", "svfWaveg",
-         "svfWveg", "vegshmat", "vbshvegshmat", "shmat", "SVFtotal"]
-
-
-def savez_fast(path, **arrays):
-    """Lossless npz (valid for np.load) with fast deflate; harness-only helper."""
-    import numpy as np
-    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
-        for name, arr in arrays.items():
-            with zf.open(name + ".npy", "w", force_zip64=True) as f:
-                np.lib.format.write_array(f, np.asanyarray(arr), allow_pickle=False)
+from _common import (NAMES, add_version_args, max_mem_gb, require_files, savez_fast,
+                     sync, tile_paths, use_version)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--version", choices=["orig", "cur"], required=True)
+    add_version_args(ap)
     ap.add_argument("--tile", required=True)
-    ap.add_argument("--data", default=DEFAULT_DATA)
+    ap.add_argument("--data", required=True,
+                    help="processed_inputs folder with Building_DSM/, Trees/ and DEM/ tiles")
     ap.add_argument("--reps", type=int, default=1)
     ap.add_argument("--warmup", type=int, default=0)
     ap.add_argument("--out", required=True, help="output .npz path (meta at .json)")
@@ -42,24 +26,15 @@ def main():
                     help="also run save_rasters=True standalone mode into this dir")
     args = ap.parse_args()
 
-    if args.version == "orig":
-        sys.path.insert(0, ORIG_ROOT)
-    import solweig_gpu
-    expected = {"orig": ORIG_ROOT, "cur": CUR_ROOT}[args.version]
-    actual = os.path.realpath(solweig_gpu.__file__)
-    assert actual.startswith(os.path.realpath(expected) + os.sep), \
-        f"import resolved to {actual}, expected under {expected}"
+    solweig_gpu, root, rev = use_version(args.version, args.orig_root)
+    bdsm, tree, dem = tile_paths(args.data, args.tile)
+    require_files(bdsm, tree, dem)
 
-    import numpy as np
     import torch
     from solweig_gpu.shadow import svf_calculator, load_raster_to_tensor
 
-    bdsm = os.path.join(args.data, "Building_DSM", f"Building_DSM_{args.tile}.tif")
-    tree = os.path.join(args.data, "Trees", f"Trees_{args.tile}.tif")
-    dem = os.path.join(args.data, "DEM", f"DEM_{args.tile}.tif")
-
-    # ---- Input prep: verbatim replica of svf_calculator standalone mode
-    # (shadow.py:582-603 current == :455-476 original).
+    # ---- Input prep: verbatim replica of svf_calculator's standalone mode (its
+    # `if save_rasters:` branch; identical in this tree, v2.0.0 and 38b451d).
     a, gdal_dsm_local = load_raster_to_tensor(bdsm)
     temp1, _ = load_raster_to_tensor(tree)
     temp2, _ = load_raster_to_tensor(dem)
@@ -77,7 +52,9 @@ def main():
     # ----
 
     meta = {
-        "version": args.version, "tile": args.tile, "module": actual,
+        "version": args.version, "tile": args.tile,
+        "module": os.path.realpath(solweig_gpu.__file__), "root": root, "rev": rev,
+        "data": os.path.abspath(args.data), "device": str(a.device),
         "shape": list(a.shape), "scale": float(scale),
         "amaxvalue": float(amaxvalue), "bush_max": float(bush.max()),
         "a_min": float(a.min()), "a_max": float(a.max()),
@@ -90,18 +67,18 @@ def main():
     for r in range(args.warmup + args.reps):
         if res is not None:
             del res
-        torch.cuda.synchronize()
+        sync()
         t0 = time.perf_counter()
         res = svf_calculator(2, amaxvalue=amaxvalue, a=a, vegdem=vegdem,
                              vegdem2=vegdem2, bush=bush, scale=scale,
                              save_rasters=False)
-        torch.cuda.synchronize()
+        sync()
         dt = time.perf_counter() - t0
         kind = "warmup" if r < args.warmup else "rep"
         meta["warmup_s" if r < args.warmup else "reps_s"].append(dt)
         print(f"[{args.version}/{args.tile}] {kind} {dt:.2f}s", flush=True)
 
-    meta["max_mem_gb"] = torch.cuda.max_memory_allocated() / 1e9
+    meta["max_mem_gb"] = max_mem_gb()
 
     if not args.no_dump:
         t0 = time.perf_counter()
@@ -118,7 +95,8 @@ def main():
     with open(args.out + ".json", "w") as fh:
         json.dump(meta, fh, indent=1)
     print("DONE", json.dumps({k: meta[k] for k in
-                              ("version", "tile", "warmup_s", "reps_s", "max_mem_gb")}),
+                              ("version", "rev", "tile", "device", "warmup_s", "reps_s",
+                               "max_mem_gb")}),
           flush=True)
 
 

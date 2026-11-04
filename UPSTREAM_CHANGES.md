@@ -7,9 +7,11 @@ outputs are unchanged.
 
 **Merged with upstream v2.0.0.** On 2026-11-04 this work was merged with upstream
 `main` at `1fec79a` (v2.0.0, 62 commits after the `38b451d` baseline). Every
-measurement and "unchanged output" claim below was made against `38b451d`; the
-merge was checked with the test suite, not re-measured with the harness. The
-merge changes four things:
+measurement and "unchanged output" claim below was made against `38b451d`. After
+the merge, the harness was re-run on synthetic tiles (§7) against both `38b451d`
+and v2.0.0: walls, aspect and the shadow matrices are bit-identical, and the `svf*`
+rasters differ only by float32 rounding (max 4.1e-6), except that `svfN*` now
+differ from `38b451d` by design. The merge changes four things:
 
 - **svfN fix.** Upstream fixed the north test in `svf_calculator`:
   `270 <= azimuth < 90` is always false, so `svfN`, `svfNveg` and `svfNaveg`
@@ -61,7 +63,7 @@ with `patch_option=2` (153 sky patches).
 | Albedo inputs | `solweig_gpu/albedo.py` (new), `solweig_gpu/preprocessor.py`, `solweig_gpu/utci_process.py`, `solweig_gpu/solweig_gpu.py`, `solweig_gpu/cli.py`, docs | optional ground albedo raster (resampled to the DSM grid), `albedo_walls` / `albedo_ground`, cool-roof air-temperature cut from a baseline albedo raster; UTCI tagged `ALBEDO=...`; resume recomputes tiles written with other albedo settings (§4) | new scenarios: per-pixel albedo, cool-roof runs | defaults bit-identical; a constant-0.15 albedo raster is bit-identical to no raster (`tests/test_albedo.py`, Mumbai tile) |
 | Tree transmissivity option | `solweig_gpu/utci_process.py`, `solweig_gpu/solweig_gpu.py`, docs | `tree_transmissivity_pct` (default `None`: the temperate season) sets the percent of light, direct and diffuse, that gets through tree canopies on every date; UTCI/Shadow tagged `TREE_TRANSMISSIVITY_PCT=...`; resume recomputes tiles written with another value (§4) | correct tree shade for tropical cities outside 7 Apr – 26 Oct; any canopy density | default bit-identical; `3` bit-identical to trees in leaf all year |
 | OpenUrban land cover | `solweig_gpu/landcover.py` (new), `solweig_gpu/preprocessor.py`, docs | `python -m solweig_gpu.landcover` converts OpenUrban to SOLWEIG codes (CIF mapping); `preprocess` rejects land cover not in SOLWEIG codes and drops stale `Landcover/` / `WindCoeff/` folders (§4) | OpenUrban no longer runs as bare soil everywhere | SOLWEIG-coded land cover unchanged |
-| Verification harness | `tools/ab_harness/` (new, 9 files) | dump / compare / profile current-vs-original | evidence for every claim above | n/a (tooling) |
+| Verification harness | `tools/ab_harness/` (new, 11 files) | dump / compare / profile current-vs-original, from any checkout; synthetic test tiles | evidence for every claim above | n/a (tooling) |
 | Packaging | `requirements.txt`, `requirements-lock.txt` (new) | pins for Python 3.14 (pandas 3.0.4 cp314 segfault) | reproducible env | n/a |
 
 Everything performance-related is **flag-gated with an environment-variable escape
@@ -564,16 +566,18 @@ buildings and 28% grass, run with a 3-row own met file. Figures are for the
 
 Everything above is backed by `tools/ab_harness/` (new), which runs the
 **original** and **current** package in separate processes against the same tiles
-(`--version orig` prepends the pristine baseline tree to `sys.path` and asserts
+(`--version cur` imports this checkout and `--version orig` the reference tree at
+`--orig-root`; each puts its root first on `sys.path` and asserts
 `solweig_gpu.__file__` before running) and compares results:
 
 | Script | Purpose |
 |---|---|
+| `make_synthetic.py` | write a deterministic 4-tile `processed_inputs` folder of a synthetic city, so the harness runs without private data; `--bush` adds phantom-bush pixels that exercise the per-patch `shadow()` path |
 | `dump_svf.py` | run `svf_calculator` on one tile, dump all 19 returned arrays losslessly + timing JSON; `--artifacts` also exercises the `save_rasters=True` path |
 | `compare_svf.py` | compare two dumps; shadow matrices must be bit-equal; `svf*` at float32-reassociation tolerance; `strict` mode requires all 19 bit-equal (used for flag-toggle A/B) |
 | `dump_walls.py` / `compare_walls.py` | time `run_parallel_processing` / per-function `findwalls` + aspect; bitwise-compare `walls_*`/`aspect_*` GeoTIFFs incl. geo metadata |
 | `compare_artifacts.py` | compare saved artifact sets (SkyViewFactor tif, `svfs.zip` members, shadow-matrix npz members) |
-| `validate_lsb.py` | rebuild every `svf*` array in float64 from the (bit-identical) shadow matrices and measure each version's distance from that float64 truth |
+| `validate_lsb.py` | rebuild every `svf*` array in float64 from the (bit-identical) shadow matrices and measure each version's distance from that float64 truth, under the svfN rule each version was made with |
 | `profile_svf.py` | per-altitude-band march timings and march/accumulate/save split |
 | `roundtrip.py` | load a written SVF cache via `utci_process.load_cached_svf_outputs` and check it matches the in-memory dump bit-for-bit |
 
@@ -695,28 +699,36 @@ local to this fork's development environment.
 ## 7. Reproducing the verification & benchmarks
 
 ```bash
-# from the fork root; original tree available at <ORIG> (pristine checkout)
-V=.venv/bin/python
+# from the fork root, with any Python that has the package's requirements
+V=python
+git worktree add ../solweig-ref 38b451d        # the baseline these numbers were measured against
+D=/tmp/ab_data; O=/tmp/ab; mkdir -p $O
+$V tools/ab_harness/make_synthetic.py $D       # or --data any processed_inputs folder
 
 # SVF: dump both versions on one tile, then compare
-$V tools/ab_harness/dump_svf.py --version orig --tile 0_1000 --out /tmp/orig.npz
-$V tools/ab_harness/dump_svf.py --version cur  --tile 0_1000 --out /tmp/cur.npz
-$V tools/ab_harness/compare_svf.py /tmp/orig.npz /tmp/cur.npz orig-vs-cur          # LSB tolerance for svf*
-$V tools/ab_harness/validate_lsb.py                                                # float64-truth distance
-$V tools/ab_harness/roundtrip.py                                                   # npz cache round-trip
+$V tools/ab_harness/dump_svf.py --version orig --orig-root ../solweig-ref --data $D --tile 0_0 --out $O/orig.npz --artifacts $O/art_orig
+$V tools/ab_harness/dump_svf.py --version cur --data $D --tile 0_0 --out $O/cur.npz --artifacts $O/art_cur
+$V tools/ab_harness/compare_svf.py $O/orig.npz $O/cur.npz orig-vs-cur     # LSB tolerance for svf*
+$V tools/ab_harness/validate_lsb.py $O/orig.npz $O/cur.npz 0_0 $D         # float64-truth distance
+$V tools/ab_harness/compare_artifacts.py $O/art_orig $O/art_cur 0_0       # saved SVF cache files
+$V tools/ab_harness/roundtrip.py $O/art_cur 0_0 $O/cur.npz $D             # npz cache round-trip
 
 # flag-toggle A/B (bit-equality required):
-SOLWEIG_COMPILE_BATCH=0 $V tools/ab_harness/dump_svf.py --version cur --tile 0_1000 --out /tmp/eager.npz
-$V tools/ab_harness/compare_svf.py /tmp/cur.npz /tmp/eager.npz compiled-vs-eager strict
+SOLWEIG_COMPILE_BATCH=0 $V tools/ab_harness/dump_svf.py --version cur --data $D --tile 0_0 --out $O/eager.npz
+$V tools/ab_harness/compare_svf.py $O/cur.npz $O/eager.npz compiled-vs-eager strict
 
 # walls/aspect: native timing + bitwise GeoTIFF comparison
-$V tools/ab_harness/dump_walls.py --version orig --out /tmp/w_orig --native
-$V tools/ab_harness/dump_walls.py --version cur  --out /tmp/w_cur  --native
-$V tools/ab_harness/compare_walls.py /tmp/w_orig /tmp/w_cur
+$V tools/ab_harness/dump_walls.py --version orig --orig-root ../solweig-ref --mode native --data $D --out $O/w_orig
+$V tools/ab_harness/dump_walls.py --version cur --mode native --data $D --out $O/w_cur
+$V tools/ab_harness/compare_walls.py $O/w_orig $O/w_cur
+
+git worktree remove ../solweig-ref
 ```
 
-(Default paths inside the harness point at the local checkout locations; every
-script takes explicit `--...` path overrides. See `tools/ab_harness/README.md`.)
+Against `38b451d`, `svfN`, `svfNveg` and `svfNaveg` are reported as expected
+differences: upstream fixed their north test in v2.0.0 (see the merge note at the
+top). Use `origin/main` as the reference to check the merged code against v2.0.0.
+See `tools/ab_harness/README.md` for every script and option.
 
 ---
 

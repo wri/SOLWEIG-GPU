@@ -1,8 +1,10 @@
 #!/usr/bin/env python
 """Walls/aspect A/B driver.
---native : one full run_parallel_processing over the Building_DSM dir (wall-clock).
---direct : per-tile findwalls + filter1Goodwin_as_aspect_v3 with separate timers,
-           dumping raw-dtype results (harness-only, lossless).
+--mode native : one full run_parallel_processing over the Building_DSM dir (wall-clock).
+--mode direct : per-tile findwalls + filter1Goodwin_as_aspect_v3 with separate timers,
+                dumping raw-dtype results (harness-only, lossless).
+Version isolation: --version cur imports solweig_gpu from this checkout,
+--version orig from --orig-root (see _common.py).
 MUST stay __main__-guarded: the original path spawns a forkserver ProcessPool that
 re-imports this module.
 """
@@ -12,37 +14,25 @@ import json
 import os
 import sys
 import time
-import zipfile
 
-ORIG_ROOT = "/home/arsh/wri/code/SOLWEIG-GPU-main_1/SOLWEIG-GPU-main"
-CUR_ROOT = "/home/arsh/wri/code/SOLWEIG-GPU-main"
-DEFAULT_DATA = os.path.join(CUR_ROOT, "data/test1/processed_inputs")
-
-
-def savez_fast(path, **arrays):
-    import numpy as np
-    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
-        for name, arr in arrays.items():
-            with zf.open(name + ".npy", "w", force_zip64=True) as f:
-                np.lib.format.write_array(f, np.asanyarray(arr), allow_pickle=False)
+from _common import add_version_args, savez_fast, use_version
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--version", choices=["orig", "cur"], required=True)
+    add_version_args(ap)
     ap.add_argument("--mode", choices=["native", "direct"], required=True)
-    ap.add_argument("--data", default=DEFAULT_DATA)
+    ap.add_argument("--data", required=True,
+                    help="processed_inputs folder with a Building_DSM/ tile folder")
     ap.add_argument("--out", required=True, help="output dir")
-    ap.add_argument("--tiles", default=None, help="comma keys for --direct")
+    ap.add_argument("--tiles", default=None,
+                    help="comma-separated tile keys for --mode direct (default: all tiles)")
     args = ap.parse_args()
 
-    if args.version == "orig":
-        sys.path.insert(0, ORIG_ROOT)
-    import solweig_gpu
-    expected = {"orig": ORIG_ROOT, "cur": CUR_ROOT}[args.version]
-    actual = os.path.realpath(solweig_gpu.__file__)
-    assert actual.startswith(os.path.realpath(expected) + os.sep), \
-        f"import resolved to {actual}, expected under {expected}"
+    solweig_gpu, root, rev = use_version(args.version, args.orig_root)
+    bdsm_dir = os.path.join(args.data, "Building_DSM")
+    if not os.path.isdir(bdsm_dir):
+        sys.exit(f"no Building_DSM folder in {args.data}")
 
     import numpy as np
     from osgeo import gdal
@@ -50,10 +40,10 @@ def main():
     from solweig_gpu.walls_aspect import (run_parallel_processing, findwalls,
                                           filter1Goodwin_as_aspect_v3, walllimit)
 
-    bdsm_dir = os.path.join(args.data, "Building_DSM")
     os.makedirs(args.out, exist_ok=True)
-    meta = {"version": args.version, "mode": args.mode, "module": actual,
-            "data": args.data}
+    meta = {"version": args.version, "mode": args.mode,
+            "module": os.path.realpath(solweig_gpu.__file__), "root": root, "rev": rev,
+            "data": os.path.abspath(args.data)}
 
     if args.mode == "native":
         wout = os.path.join(args.out, "walls")
@@ -66,10 +56,13 @@ def main():
         meta["wall_clock_s"] = time.perf_counter() - t0
         meta["n_tiles"] = len([f for f in os.listdir(bdsm_dir) if f.endswith(".tif")])
     else:
-        tiles = args.tiles.split(",")
+        prefix = "Building_DSM_"
+        tiles = args.tiles.split(",") if args.tiles else sorted(
+            f[len(prefix):-len(".tif")] for f in os.listdir(bdsm_dir)
+            if f.startswith(prefix) and f.endswith(".tif"))
         meta["tiles"] = {}
         for key in tiles:
-            path = os.path.join(bdsm_dir, f"Building_DSM_{key}.tif")
+            path = os.path.join(bdsm_dir, f"{prefix}{key}.tif")
             ds = gdal.Open(path)
             gt = ds.GetGeoTransform()
             scale = 1 / gt[1]

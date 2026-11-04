@@ -8,16 +8,21 @@ FLOAT64 from the shared shadow matrices and the exact patch/weight definitions,
 then measures how far each version's float32 result is from the float64 truth.
 If both are within a few float32 ulps, the difference is rounding, full stop.
 
-Usage: validate_lsb.py <orig.npz> <cur.npz> <tile_key> [data_dir]
+svfN/svfNveg/svfNaveg: upstream v2.0.0 fixed the north test (`270 <= azimuth < 90`
+was never true, so the three arrays stayed zero). Each dump is checked against the
+rule it was made with: zeros if its N arrays are all zero, else the accumulation.
+
+Usage: validate_lsb.py <orig.npz> <cur.npz> <tile_key> <data_dir>
+  data_dir: the processed_inputs folder the dumps were made from
 """
 import sys
 
 import numpy as np
 from osgeo import gdal
 
-gdal.UseExceptions()
+from _common import N_ARRAYS, n_branch_dead
 
-DATA_DEFAULT = "/home/arsh/wri/code/SOLWEIG-GPU-main/data/test1/processed_inputs"
+gdal.UseExceptions()
 
 # patch_option=2 (identical in both versions)
 ANNULINO = [0, 12, 24, 36, 48, 60, 72, 84, 90]
@@ -35,8 +40,9 @@ def annulus_weight64(k, aziinterval):
 
 
 def main():
-    orig_npz, cur_npz, tile = sys.argv[1], sys.argv[2], sys.argv[3]
-    data = sys.argv[4] if len(sys.argv) > 4 else DATA_DEFAULT
+    if len(sys.argv) != 5:
+        sys.exit(__doc__)
+    orig_npz, cur_npz, tile, data = sys.argv[1:5]
     O, C = np.load(orig_npz), np.load(cur_npz)
 
     for m in ("shmat", "vegshmat", "vbshvegshmat"):
@@ -107,7 +113,11 @@ def main():
                 svfW += wa * sh
                 svfWveg += wa * veg
                 svfWaveg += wa * vbs
-            # N branch is dead in both versions (270 <= az < 90 never true)
+            # N as accumulated since upstream v2.0.0; no 3.0459e-4 / `last` term
+            if azimuth >= 270 or azimuth < 90:
+                svfN += wa * sh
+                svfNveg += wa * veg
+                svfNaveg += wa * vbs
             index += 1
 
     svfS += 3.0459e-4
@@ -126,20 +136,31 @@ def main():
         ref[k] = np.minimum(ref[k], 1.0)
     ref["SVFtotal"] = ref["svf"] - (1 - ref["svfveg"]) * (1 - 0.03)
 
+    # Which north rule made each dump: dead (all zero, before v2.0.0) or fixed.
+    dead = {"orig": n_branch_dead(O.__getitem__), "cur": n_branch_dead(C.__getitem__)}
+    print("svfN branch: " + ", ".join(
+        f"{v} {'dead (before v2.0.0)' if dead[v] else 'fixed (v2.0.0+)'}" for v in dead))
+    zero = np.zeros((rows, cols), dtype=np.float64)
+
+    def truth(name, version):
+        return zero if name in N_ARRAYS and dead[version] else ref[name]
+
     print(f"{'array':12s} {'|orig-ref|max':>14s} {'|cur-ref|max':>14s} "
           f"{'|orig-cur|max':>14s}  (float32 eps at 1.0 = 1.19e-07)")
     worst = 0.0
-    for n, r in ref.items():
-        do = float(np.abs(O[n].astype(np.float64) - r).max())
-        dc = float(np.abs(C[n].astype(np.float64) - r).max())
+    for n in ref:
+        do = float(np.abs(O[n].astype(np.float64) - truth(n, "orig")).max())
+        dc = float(np.abs(C[n].astype(np.float64) - truth(n, "cur")).max())
         db = float(np.abs(O[n].astype(np.float64) - C[n].astype(np.float64)).max())
         worst = max(worst, do, dc)
-        print(f"{n:12s} {do:14.3e} {dc:14.3e} {db:14.3e}")
+        note = "  (svfN fix)" if n in N_ARRAYS and dead["orig"] != dead["cur"] else ""
+        print(f"{n:12s} {do:14.3e} {dc:14.3e} {db:14.3e}{note}")
     print(f"\nWorst distance from float64 truth (either version): {worst:.3e} "
           f"= {worst/1.19e-07:.1f} float32 ulps at 1.0")
     print("CONCLUSION:", "both versions are correct float32 roundings of the same "
           "mathematical result — differences are summation-order rounding only"
           if worst < 5e-6 else "*** diffs exceed rounding scale — investigate ***")
+    sys.exit(0 if worst < 5e-6 else 1)
 
 
 if __name__ == "__main__":

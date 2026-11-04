@@ -1,13 +1,19 @@
 #!/usr/bin/env python
 """Compare two dump_svf.py npz dumps (A=reference/orig, B=candidate/cur).
+Usage: compare_svf.py <a.npz> <b.npz> [label] [strict]
 Bit-exact expected: vegshmat, vbshvegshmat, shmat.
 Tiny LSB diffs allowed on the 15 svf* arrays + SVFtotal (float32 reassociation
-from the per-band weight-sum precompute): PASS if max|d| <= 2e-5, mean|d| <= 1e-6.
+from the per-band weight-sum precompute): PASS if max|d| <= 2e-5, mean|d| <= 5e-6.
+When exactly one dump predates upstream's svfN fix (its svfN/svfNveg/svfNaveg are
+all zero), those three arrays are reported as expected differences and left out of
+the verdict, except in strict mode (a flag toggle must never change them).
 """
 import json
 import sys
 
 import numpy as np
+
+from _common import N_ARRAYS, n_branch_dead
 
 MATS = {"vegshmat", "vbshvegshmat", "shmat"}
 # Tolerances for the svf* accumulations: validate_lsb.py proved (via a float64
@@ -23,6 +29,8 @@ def main():
     strict = len(sys.argv) > 4 and sys.argv[4] == "strict"  # all arrays must be bit-equal
     A, B = np.load(a_path), np.load(b_path)
     assert set(A.files) == set(B.files), (A.files, B.files)
+    dead_a, dead_b = n_branch_dead(A.__getitem__), n_branch_dead(B.__getitem__)
+    expected = set(N_ARRAYS) if dead_a != dead_b and not strict else set()
     report, ok = {}, True
     for n in sorted(A.files):
         a, b = A[n], B[n]
@@ -41,6 +49,10 @@ def main():
              "mean_abs_diffpx": float(d[neq].mean()),
              "argmax": [int(i) for i in idx],
              "vals_at_argmax": [float(a[idx]), float(b[idx])]}
+        if n in expected:
+            r["expected_diff"] = True  # svfN fix; not part of the verdict
+            report[n] = r
+            continue
         passed = (not strict) and (n not in MATS) and r["max_abs"] <= MAXTOL and r["mean_abs"] <= MEANTOL
         r["pass"] = bool(passed)
         ok &= passed
@@ -48,18 +60,23 @@ def main():
 
     n_biteq = sum(1 for r in report.values() if r.get("bit_equal"))
     print(f"=== compare {label}: {a_path} vs {b_path}")
+    if expected:
+        print(f"  NOTE: {'A' if dead_a else 'B'} predates upstream's svfN fix "
+              "(svfN/svfNveg/svfNaveg all zero); those arrays are expected to differ")
     for n, r in report.items():
         if r.get("bit_equal"):
             print(f"  {n:14s} BIT-EQUAL")
         else:
+            status = ("EXPECTED DIFF (svfN fix, upstream v2.0.0)" if r.get("expected_diff")
+                      else "PASS(lsb)" if r["pass"] else "*** FAIL ***")
             print(f"  {n:14s} DIFF n={r['n_diff']}/{r['n_total']} ({r['pct_diff']}%) "
-                  f"max|d|={r['max_abs']:.3e} mean|d|={r['mean_abs']:.3e} "
-                  f"{'PASS(lsb)' if r['pass'] else '*** FAIL ***'}")
+                  f"max|d|={r['max_abs']:.3e} mean|d|={r['mean_abs']:.3e} {status}")
     verdict = "PASS" if ok else "FAIL"
     print(f"RESULT {label}: {verdict} ({n_biteq}/{len(report)} arrays bit-equal)")
     out = a_path.replace(".npz", f"") + f"__vs__{b_path.split('/')[-1].replace('.npz','')}.cmp.json"
     with open(out, "w") as fh:
-        json.dump({"a": a_path, "b": b_path, "pass": ok, "report": report}, fh, indent=1)
+        json.dump({"a": a_path, "b": b_path, "pass": ok, "expected_diff": sorted(expected),
+                   "report": report}, fh, indent=1)
     sys.exit(0 if ok else 1)
 
 

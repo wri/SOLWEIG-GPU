@@ -1,37 +1,33 @@
 #!/usr/bin/env python
-"""Profile CURRENT svf_calculator: per-region wall times (march fill vs rest vs
-save), per-band shadow_batch times, kernel counts per march step.
-Run only against the CURRENT version (no --version switch).
+"""Profile this checkout's svf_calculator: per-region wall times (march fill vs rest
+vs save), per-band shadow_batch times, kernel counts per march step.
+Uses this checkout's solweig_gpu only (shadow_batch does not exist upstream).
 """
 import argparse
 import json
 import os
-import sys
 import time
 
-CUR_ROOT = "/home/arsh/wri/code/SOLWEIG-GPU-main"
-DEFAULT_DATA = os.path.join(CUR_ROOT, "data/test1/processed_inputs")
+from _common import max_mem_gb, require_files, sync, tile_paths, use_version
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tile", required=True)
-    ap.add_argument("--data", default=DEFAULT_DATA)
+    ap.add_argument("--data", required=True,
+                    help="processed_inputs folder with Building_DSM/, Trees/ and DEM/ tiles")
     ap.add_argument("--out", required=True, help="json report path")
     ap.add_argument("--save-dir", default=None, help="time save_svf_zip_npz_outputs into here")
     ap.add_argument("--profile-kernels", action="store_true")
     args = ap.parse_args()
 
-    import numpy as np
+    _, root, rev = use_version("cur")
+    bdsm, tree, dem = tile_paths(args.data, args.tile)
+    require_files(bdsm, tree, dem)
+
     import torch
-    import solweig_gpu
-    assert "SOLWEIG-GPU-main_1" not in solweig_gpu.__file__
     import solweig_gpu.shadow as sh
     from solweig_gpu.shadow import load_raster_to_tensor
-
-    bdsm = os.path.join(args.data, "Building_DSM", f"Building_DSM_{args.tile}.tif")
-    tree = os.path.join(args.data, "Trees", f"Trees_{args.tile}.tif")
-    dem = os.path.join(args.data, "DEM", f"DEM_{args.tile}.tif")
 
     a, gdal_dsm = load_raster_to_tensor(bdsm)
     temp1, _ = load_raster_to_tensor(tree)
@@ -47,28 +43,20 @@ def main():
     vegdem2[vegdem2 == a] = 0.0
     amaxvalue = torch.maximum(a.max(), vegdem_height.max())
 
-    report = {"tile": args.tile, "shape": list(a.shape), "scale": float(scale),
+    report = {"tile": args.tile, "root": root, "rev": rev, "device": str(a.device),
+              "shape": list(a.shape), "scale": float(scale),
               "flags": {k: v for k, v in os.environ.items() if k.startswith("SOLWEIG_")}}
 
     # --- wrap shadow_batch with a sync-timing decorator (batch boundaries only)
     orig_shadow_batch = sh.shadow_batch
     batch_calls = []
 
-    def timed_shadow_batch(*a_, **kw):
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        out = orig_shadow_batch(*a_, **kw)
-        torch.cuda.synchronize()
-        batch_calls.append({"P": int(a_[5].shape[0]) if len(a_) > 5 else -1,
-                            "s": time.perf_counter() - t0})
-        return out
-
     # positional: shadow_batch(march_ceiling, a, vegdem, vegdem2, azimuths, altitude, scale, pad_to=None)
     def timed_shadow_batch_fix(march_ceiling, a_, vegdem_, vegdem2_, azimuths, altitude, scale_, **kw):
-        torch.cuda.synchronize()
+        sync()
         t0 = time.perf_counter()
         out = orig_shadow_batch(march_ceiling, a_, vegdem_, vegdem2_, azimuths, altitude, scale_, **kw)
-        torch.cuda.synchronize()
+        sync()
         batch_calls.append({"P": int(azimuths.shape[0]), "alt": float(altitude),
                             "pad": kw.get("pad_to"), "s": round(time.perf_counter() - t0, 4)})
         return out
@@ -76,19 +64,19 @@ def main():
     sh.shadow_batch = timed_shadow_batch_fix
     try:
         # warmup (torch.compile of _shadow_core etc.)
-        torch.cuda.synchronize(); t0 = time.perf_counter()
+        sync(); t0 = time.perf_counter()
         res = sh.svf_calculator(2, amaxvalue=amaxvalue, a=a, vegdem=vegdem,
                                 vegdem2=vegdem2, bush=bush, scale=scale, save_rasters=False)
-        torch.cuda.synchronize()
+        sync()
         report["warmup_total_s"] = time.perf_counter() - t0
         report["warmup_batch_calls"] = list(batch_calls)
         del res
         batch_calls.clear()
 
-        torch.cuda.synchronize(); t0 = time.perf_counter()
+        sync(); t0 = time.perf_counter()
         res = sh.svf_calculator(2, amaxvalue=amaxvalue, a=a, vegdem=vegdem,
                                 vegdem2=vegdem2, bush=bush, scale=scale, save_rasters=False)
-        torch.cuda.synchronize()
+        sync()
         total = time.perf_counter() - t0
     finally:
         sh.shadow_batch = orig_shadow_batch
@@ -98,7 +86,7 @@ def main():
     report["march_s"] = march
     report["non_march_s"] = total - march   # accumulation + weights + allocs
     report["batch_calls"] = batch_calls
-    report["max_mem_gb"] = torch.cuda.max_memory_allocated() / 1e9
+    report["max_mem_gb"] = max_mem_gb()
 
     if args.save_dir:
         os.makedirs(args.save_dir, exist_ok=True)
@@ -125,9 +113,12 @@ def main():
         az = torch.arange(16, device=a.device, dtype=torch.float32) * (360.0 / 28) + 2
         orig_shadow_batch(ceiling, a, vegdem, vegdem2, az, skyvaultaltint[2], scale)  # warm
         from torch.profiler import profile, ProfilerActivity
-        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        activities = [ProfilerActivity.CPU]
+        if torch.cuda.is_available():
+            activities.append(ProfilerActivity.CUDA)
+        with profile(activities=activities) as prof:
             orig_shadow_batch(ceiling, a, vegdem, vegdem2, az, skyvaultaltint[2], scale)
-        torch.cuda.synchronize()
+        sync()
         evs = prof.key_averages()
         kernels = [(e.key, e.count, e.device_time_total) for e in evs if e.device_time_total > 0]
         n_launch = sum(c for _, c, _ in kernels)
