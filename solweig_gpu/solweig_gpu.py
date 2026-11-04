@@ -35,6 +35,9 @@ def preprocess(
     own_met_file: Optional[str] = None,
     preprocess_dir: Optional[str] = None,
     use_uhi: bool = True,
+    hours: Optional[List[int]] = None,
+    albedo_filename: Optional[str] = None,
+    baseline_albedo_filename: Optional[str] = None,
 ) -> str:
     """
     Run preprocessing only: validate rasters, create tiles, and prepare metfiles.
@@ -60,6 +63,18 @@ def preprocess(
         use_uhi: If True, use UHI-aware ERA5 processing and write UHI_CYCLE/uhii
             into generated metfiles when available. If False, use standard ERA5
             processing and write uhii = 0.0.
+        hours: Optional list of UTC hours-of-day to simulate (e.g. [4, 9, 12]).
+            If None, every timestep in [start_time, end_time] is used. The window
+            must span the requested hours. Ignored when use_own_met is True.
+            Each hour gets the same sun position as in a full-day run: the middle
+            of the hour its radiation is averaged over (30 min before its label).
+        albedo_filename: Optional ground albedo raster (fractions 0-1, e.g. CIF
+            cloud-masked albedo). It replaces the land-cover or default ground
+            albedo; any grid is resampled onto the Building DSM grid.
+        baseline_albedo_filename: Optional baseline albedo raster for cool-roof
+            scenarios (requires albedo_filename). The forcing air temperature is
+            then lowered by 6 x (mean albedo increase) °C at 12:00 local time,
+            scaled down to 18:00 and not applied outside 12:00-18:00.
 
     Returns:
         The path to the preprocessing directory (tiles and metfiles written there).
@@ -89,6 +104,9 @@ def preprocess(
         own_met_file,
         preprocess_dir=preprocess_dir,
         use_uhi=use_uhi,
+        hours=hours,
+        albedo_filename=albedo_filename,
+        baseline_albedo_filename=baseline_albedo_filename,
     )
     return preprocess_dir
 
@@ -147,16 +165,22 @@ def build_inputs(
     )
 
 
-def run_walls_aspect(preprocess_dir: str) -> None:
+def run_walls_aspect(preprocess_dir: str, overwrite: bool = False) -> None:
     """
     Run wall height and aspect calculation for all tiles in the preprocessing directory.
 
     Call this after :func:`preprocess`. Writes to ``{preprocess_dir}/walls`` and
     ``{preprocess_dir}/aspect``.
 
+    Walls and aspect depend only on geometry, so by default existing tiles are
+    reused across runs (e.g. when only the simulation time changes). Pass
+    ``overwrite=True`` to force recomputation after changing the input rasters,
+    ``tile_size`` or ``overlap``.
+
     Args:
         preprocess_dir: Path returned by :func:`preprocess` (contains
             Building_DSM/, DEM/, Trees/, etc.).
+        overwrite: If True, recompute and overwrite existing walls/aspect tiles.
     """
     import os
     from .walls_aspect import run_parallel_processing
@@ -164,7 +188,7 @@ def run_walls_aspect(preprocess_dir: str) -> None:
     building_dsm_dir = os.path.join(preprocess_dir, "Building_DSM")
     walls_dir = os.path.join(preprocess_dir, "walls")
     aspect_dir = os.path.join(preprocess_dir, "aspect")
-    run_parallel_processing(building_dsm_dir, walls_dir, aspect_dir)
+    run_parallel_processing(building_dsm_dir, walls_dir, aspect_dir, overwrite=overwrite)
 
 def calculate_svf(base_path: str, patch_option: int = 2, overwrite: bool = False) -> None:
     """
@@ -259,11 +283,10 @@ def calculate_svf(base_path: str, patch_option: int = 2, overwrite: bool = False
         svf_results = svf_calculator(patch_option=patch_option, save_rasters=True, building_dsm_path=building_tiles[key],
             tree_path=tree_tiles[key], dem_path=dem_tiles[key], output_dir=svf_output_dir, number=key,)
 
-        # Do not keep GPU tensors in memory after each tile.
+        # Do not keep GPU tensors in memory after each tile. The caching allocator reuses these freed
+        # blocks for the next tile; calling empty_cache() here would instead cudaFree everything and
+        # force an expensive cudaMalloc (+ device sync) on the next tile, so it is intentionally omitted.
         del svf_results
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
     print("[INFO] Standalone SVF calculation complete.")
 
@@ -282,6 +305,12 @@ def run_utci_tiles(
     save_wbgt: bool = False,
     save_ta: bool = False,
     save_wind: bool = False,
+    clip_buildings: bool = True,
+    overwrite: bool = False,
+    albedo_walls: float = 0.2,
+    albedo_ground: float = 0.15,
+    air_temp_cut: Optional[float] = None,
+    tree_transmissivity_pct: Optional[float] = None,
 ) -> None:
     """
     Run UTCI (and optional outputs) for tiles in the preprocessing directory.
@@ -298,11 +327,39 @@ def run_utci_tiles(
             Which outputs to save (UTCI is always saved).
         save_ta: Save diagnostic Ta field.
         save_wind: Save diagnostic wind field.
+        clip_buildings: If True (default), building footprints (Building DSM -
+            DEM >= 2 m) are NaN in the UTCI and Shadow outputs. If False, those
+            outputs keep the rooftop values.
+        overwrite: If False (default), skip any tile whose UTCI output and every
+            other requested output already exist on disk, so an interrupted run
+            resumes instead of recomputing finished tiles. A tile whose UTCI or
+            Shadow output was written with a different ``clip_buildings`` or
+            ``tree_transmissivity_pct`` setting (or before the latter was
+            recorded), or whose UTCI was written with different albedo settings,
+            is recomputed. Pass True to force recomputation and overwrite
+            existing tile outputs.
+        albedo_walls: Wall albedo (0-1).
+        albedo_ground: Ground albedo (0-1) used where there is neither land cover
+            nor an albedo raster.
+        air_temp_cut: Cool-roof air-temperature cut at 12:00 local time (°C). None
+            (default) uses the cut that :func:`preprocess` derived from
+            ``baseline_albedo_filename``, or no cut if there was none.
+        tree_transmissivity_pct: Percent (0-100) of the light, direct sun and
+            diffuse sky light, that gets through tree canopies on every date,
+            e.g. 3 for trees in leaf all year as in tropical cities. None
+            (default) uses a temperate deciduous season: 3% on days 98-299, and
+            outside it 50% of the direct sun (3% of the diffuse light).
     """
     import os
     import numpy as np
     import torch
-    from .utci_process import compute_utci, map_files_by_key
+    from .albedo import air_temp_cut_factor, albedo_state, albedo_tag, check_fraction, read_air_temp_cut
+    from .utci_process import (check_tree_transmissivity, clip_state, compute_utci, map_files_by_key,
+                               map_metfiles_by_key, tree_state, tree_tag)
+
+    albedo_walls = check_fraction("albedo_walls", albedo_walls)
+    albedo_ground = check_fraction("albedo_ground", albedo_ground)
+    tree_transmissivity_pct = check_tree_transmissivity(tree_transmissivity_pct)
 
     base_output_path = os.path.join(base_path, "output_folder")
     input_met = os.path.join(preprocess_dir, "metfiles")
@@ -311,6 +368,7 @@ def run_utci_tiles(
     dem_dir = os.path.join(preprocess_dir, "DEM")
     landcover_dir = os.path.join(preprocess_dir, "Landcover")
     windcoeff_dir = os.path.join(preprocess_dir, "WindCoeff")
+    albedo_dir = os.path.join(preprocess_dir, "Albedo")
     walls_dir = os.path.join(preprocess_dir, "walls")
     aspect_dir = os.path.join(preprocess_dir, "aspect")
 
@@ -319,14 +377,25 @@ def run_utci_tiles(
     dem_map = map_files_by_key(dem_dir, ".tif")
     landcover_map = map_files_by_key(landcover_dir, ".tif") if os.path.isdir(landcover_dir) else {}
     windcoeff_map = map_files_by_key(windcoeff_dir, ".tif") if os.path.isdir(windcoeff_dir) else {}
+    albedo_map = map_files_by_key(albedo_dir, ".tif") if os.path.isdir(albedo_dir) else {}
     walls_map = map_files_by_key(walls_dir, ".tif")
     aspect_map = map_files_by_key(aspect_dir, ".tif")
-    met_map = map_files_by_key(input_met, ".txt")
+    met_map = map_metfiles_by_key(input_met, selected_date_str)
 
     common_keys = set(building_dsm_map) & set(tree_map) & set(dem_map) & set(met_map) & set(walls_map) & set(aspect_map)
 
     if landcover_map:
         common_keys &= set(landcover_map)
+
+    if albedo_map:
+        common_keys &= set(albedo_map)
+
+    if air_temp_cut is None:
+        air_temp_cut = read_air_temp_cut(albedo_dir)
+    air_temp_cut = float(air_temp_cut)
+    if air_temp_cut:
+        print(f"[INFO] Cool-roof air-temperature cut: {air_temp_cut:.2f} °C at 12:00 local time")
+    cut_hours_checked = False
 
     # Do NOT force intersection with windcoeff_map, because windcoeff is optional
     if tile_keys is not None:
@@ -345,14 +414,77 @@ def run_utci_tiles(
         dem_path = dem_map[key]
         landcover_path = landcover_map.get(key) if landcover_map else None
         windcoeff_path = windcoeff_map.get(key) if windcoeff_map else None
+        albedo_path = albedo_map.get(key) if albedo_map else None
         walls_path = walls_map[key]
         aspect_path = aspect_map[key]
         met_file_path = met_map[key]
 
         output_folder = os.path.join(base_output_path, key)
+
+        if not overwrite:
+            # UTCI is always written; each enabled save_* flag adds one GeoTIFF,
+            # all written together at the end of compute_utci (so a tile is
+            # effectively all-or-nothing). SVF is intentionally excluded: in the
+            # normal pipeline the SVF cache exists, so compute_utci reuses it and
+            # never writes SVF_{key}.tif here -- its absence is not "unfinished".
+            expected = [os.path.join(output_folder, f"UTCI_{key}.tif")]
+            if save_tmrt:
+                expected.append(os.path.join(output_folder, f"TMRT_{key}.tif"))
+            if save_kup:
+                expected.append(os.path.join(output_folder, f"Kup_{key}.tif"))
+            if save_kdown:
+                expected.append(os.path.join(output_folder, f"Kdown_{key}.tif"))
+            if save_lup:
+                expected.append(os.path.join(output_folder, f"Lup_{key}.tif"))
+            if save_ldown:
+                expected.append(os.path.join(output_folder, f"Ldown_{key}.tif"))
+            if save_shadow:
+                expected.append(os.path.join(output_folder, f"Shadow_{key}.tif"))
+            if save_wbgt:
+                expected.append(os.path.join(output_folder, f"WBGT_{key}.tif"))
+            if save_ta:
+                expected.append(os.path.join(output_folder, f"Ta_{key}.tif"))
+            if save_wind:
+                expected.append(os.path.join(output_folder, f"Wind_{key}.tif"))
+            if all(os.path.exists(p) for p in expected):
+                # UTCI/Shadow must also have been written with the requested
+                # clip_buildings and tree_transmissivity_pct settings, and UTCI
+                # with the requested albedo settings, otherwise the tile is
+                # recomputed.
+                tagged = [("UTCI", expected[0])]
+                if save_shadow:
+                    tagged.append(("Shadow", os.path.join(output_folder, f"Shadow_{key}.tif")))
+                stale = [os.path.basename(p) for var, p in tagged if clip_state(p, var) != clip_buildings]
+                reasons = []
+                if stale:
+                    reasons.append(f"{', '.join(stale)} not written with clip_buildings={clip_buildings}")
+                written_albedo = albedo_state(expected[0])
+                wanted_albedo = albedo_tag(albedo_path, albedo_ground, albedo_walls, air_temp_cut)
+                if written_albedo != wanted_albedo:
+                    reasons.append(f"{os.path.basename(expected[0])} written with albedo settings "
+                                   f"{written_albedo}, not {wanted_albedo}")
+                stale_trees = [os.path.basename(p) for _, p in tagged
+                               if tree_state(p) != tree_tag(tree_transmissivity_pct)]
+                if stale_trees:
+                    reasons.append(f"{', '.join(stale_trees)} not written with "
+                                   f"tree_transmissivity_pct={tree_transmissivity_pct}")
+                if not reasons:
+                    print(f"[skip] tile {key}: outputs already exist (overwrite=False)")
+                    continue
+                print(f"[rerun] tile {key}: {'; '.join(reasons)}; recomputing")
+
         os.makedirs(output_folder, exist_ok=True)
 
-        met_file_data = np.loadtxt(met_file_path, skiprows=1, delimiter=' ')
+        met_file_data = np.loadtxt(met_file_path, skiprows=1, delimiter=' ', ndmin=2)
+
+        if air_temp_cut and not cut_hours_checked:
+            cut_hours_checked = True
+            factors = air_temp_cut_factor(met_file_data[:, 2] + met_file_data[:, 3] / 60.0)
+            uncut = [f"{int(h):02d}:{int(m):02d}"
+                     for h, m, f in zip(met_file_data[:, 2], met_file_data[:, 3], factors) if f == 0.0]
+            if uncut:
+                print(f"[WARNING] The cool-roof air-temperature cut only applies between 12:00 and "
+                      f"18:00 local time; no cut at {', '.join(uncut[:6])}{' ...' if len(uncut) > 6 else ''}")
 
         compute_utci(
             building_dsm_path,
@@ -376,8 +508,13 @@ def run_utci_tiles(
             save_wbgt=save_wbgt,
             save_ta=save_ta,
             save_wind=save_wind,
+            clip_buildings=clip_buildings,
+            albedo_path=albedo_path,
+            albedo_walls=albedo_walls,
+            albedo_ground=albedo_ground,
+            air_temp_cut=air_temp_cut,
+            tree_transmissivity_pct=tree_transmissivity_pct,
         )
-        torch.cuda.empty_cache()
 
 
 def thermal_comfort(
@@ -397,6 +534,7 @@ def thermal_comfort(
     data_folder=None,
     own_met_file=None,
     use_uhi=True,
+    hours=None,
     save_tmrt=True,
     save_svf=False,
     save_kup=False,
@@ -407,6 +545,12 @@ def thermal_comfort(
     save_wbgt=False,
     save_ta=False,
     save_wind=False,
+    clip_buildings=True,
+    albedo_filename: Optional[str] = None,
+    baseline_albedo_filename: Optional[str] = None,
+    albedo_walls=0.2,
+    albedo_ground=0.15,
+    tree_transmissivity_pct: Optional[float] = None,
 ):
     """
     Main function to compute urban thermal comfort using the SOLWEIG-GPU model.
@@ -429,6 +573,10 @@ def thermal_comfort(
         own_met_file (str, optional): Path to custom meteorological text file
         use_uhi (bool): If True, use UHI-aware ERA5 processing and propagate
             UHI_CYCLE into metfiles. If False, disable it and write uhii = 0.0.
+        hours (list[int], optional): UTC hours-of-day to simulate (e.g. [4, 9, 12]).
+            If None, every timestep in [start_time, end_time] is used. The window
+            must span the requested hours. Ignored when use_own_met is True.
+            Each hour gets the same sun position as in a full-day run.
         save_tmrt (bool): Save mean radiant temperature output.
         save_svf (bool): Save sky view factor output.
         save_kup (bool): Save upward shortwave radiation.
@@ -438,6 +586,22 @@ def thermal_comfort(
         save_shadow (bool): Save shadow maps.
         save_ta (bool): Save diagnostic Ta field.
         save_wind (bool): Save diagnostic wind field.
+        clip_buildings (bool): Set building footprints (Building DSM - DEM >= 2 m)
+            to NaN in the UTCI and Shadow outputs (default). False keeps the
+            rooftop values.
+        albedo_filename (str, optional): Ground albedo raster (fractions 0-1) path
+            or filename. Replaces the land-cover or default ground albedo.
+        baseline_albedo_filename (str, optional): Baseline albedo raster for
+            cool-roof scenarios (requires albedo_filename); lowers the forcing air
+            temperature by 6 x (mean albedo increase) °C at 12:00 local time,
+            scaled down to 18:00 and not applied outside 12:00-18:00.
+        albedo_walls (float): Wall albedo (0-1).
+        albedo_ground (float): Ground albedo (0-1) used where there is neither
+            land cover nor an albedo raster.
+        tree_transmissivity_pct (float, optional): Percent (0-100) of the light
+            that gets through tree canopies on every date, e.g. 3 for trees in
+            leaf all year (tropical cities). None uses a temperate deciduous
+            season (leafless outside days 98-299).
 
     Returns:
         None
@@ -459,6 +623,9 @@ def thermal_comfort(
         data_folder=data_folder,
         own_met_file=own_met_file,
         use_uhi=use_uhi,
+        hours=hours,
+        albedo_filename=albedo_filename,
+        baseline_albedo_filename=baseline_albedo_filename,
     )
 
     run_walls_aspect(preprocess_dir)
@@ -480,4 +647,8 @@ def thermal_comfort(
         save_wbgt=save_wbgt,
         save_ta=save_ta,
         save_wind=save_wind,
+        clip_buildings=clip_buildings,
+        albedo_walls=albedo_walls,
+        albedo_ground=albedo_ground,
+        tree_transmissivity_pct=tree_transmissivity_pct,
     )

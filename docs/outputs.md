@@ -36,6 +36,8 @@ Each subfolder is named by the tile key (e.g., `0_0`, `0_1000`, `1000_0`). File 
 
 UTCI is always computed and saved. It provides a comprehensive measure of thermal comfort that accounts for air temperature, mean radiant temperature, wind speed, and humidity.
 
+By default, building footprints are clipped (see [Building clipping](#building-clipping)): they are NaN in the UTCI output.
+
 **Interpretation:**
 
 | UTCI Range (°C) | Thermal Stress Category |
@@ -121,6 +123,46 @@ SVF is a geometric parameter that quantifies the openness of a location to the s
 **Description:** Shadow/sunlit classification for each pixel.
 
 **Saved when:** `save_shadow=True`
+
+By default, building footprints are clipped (see [Building clipping](#building-clipping)): they are NaN in the Shadow output.
+
+## Building Clipping
+
+`clip_buildings` (default `True`) controls whether building footprints are set to NaN in the **UTCI** and **Shadow** outputs. A pixel counts as a building where Building DSM − DEM ≥ 2 m; pixels with no DSM/DEM data are treated the same way. Pass `clip_buildings=False` to `thermal_comfort()` or `run_utci_tiles()` (or `--clip_buildings False` on the command line) to keep the rooftop values. The other outputs are never clipped, and the physics is identical either way; only the written values change.
+
+Each UTCI and Shadow GeoTIFF records the setting it was written with in a dataset metadata item, `CLIP_BUILDINGS=YES` or `NO`:
+
+```python
+from osgeo import gdal
+
+ds = gdal.Open('output_folder/0_0/UTCI_0_0.tif')
+print(ds.GetMetadataItem('CLIP_BUILDINGS'))  # 'YES' or 'NO'
+```
+
+When a run resumes with `overwrite=False`, a tile whose UTCI or Shadow was written with the other setting is recomputed rather than skipped. Outputs written before this option existed carry no tag; their UTCI is clipped and their Shadow is not, so tiles with a saved Shadow are recomputed once under either setting.
+
+## Albedo Settings Tag
+
+Each UTCI GeoTIFF also records the albedo settings it was computed with (see [Input Data – Albedo](input_data.md#albedo-optional)) in an `ALBEDO` metadata item:
+
+```python
+print(ds.GetMetadataItem('ALBEDO'))
+# e.g. 'raster=none;ground=0.15;walls=0.2;cut=0'
+#      'raster=3f9c0a1e5b7d2c44;ground=0.15;walls=0.2;cut=0.313'
+```
+
+`raster` is a fingerprint of the tile's albedo raster (`none` without one), `ground` and `walls` are `albedo_ground` and `albedo_walls`, and `cut` is the cool-roof air-temperature cut at 12:00 (°C). When a run resumes with `overwrite=False`, a tile whose UTCI was written with other albedo settings is recomputed. Outputs written before this tag existed used the defaults (`raster=none;ground=0.15;walls=0.2;cut=0`), so they are only recomputed if you change a setting.
+
+## Tree Transmissivity Tag
+
+Each UTCI and Shadow GeoTIFF also records the `tree_transmissivity_pct` it was computed with (see [Configuration – Tree Transmissivity](configuration.md#tree-transmissivity-configuration)) in a `TREE_TRANSMISSIVITY_PCT` metadata item:
+
+```python
+print(ds.GetMetadataItem('TREE_TRANSMISSIVITY_PCT'))
+# 'seasonal' for the default (None), otherwise the percentage, e.g. '3'
+```
+
+When a run resumes with `overwrite=False`, a tile whose UTCI or Shadow was written with another value is recomputed. Outputs written before this tag existed are recomputed once, since their trees may have been in leaf all year or only seasonally.
 
 ## Multi-Band Structure
 

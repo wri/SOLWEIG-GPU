@@ -203,5 +203,51 @@ class TestDayLength(unittest.TestCase):
         self.assertAlmostEqual(DEC.item(), 0.0, delta=5.0)
 
 
+class TestSunTimeOffset(unittest.TestCase):
+    """The sun is placed half a native step before each metfile row (30 min for hourly data)."""
+
+    # Mumbai on 2024-05-29 (DOY 150), Asia/Kolkata
+    LOCATION = {'longitude': 72.85, 'latitude': 19.07, 'altitude': 3.}
+    UTC = 5.5
+
+    def _sun(self, times):
+        from solweig_gpu.sun_position import Solweig_2015a_metdata_noload
+        met = np.array([[2024, 150, h, m] for h, m in times], dtype=float)
+        _, altitude, azimuth, *_ = Solweig_2015a_metdata_noload(met, self.LOCATION, self.UTC)
+        return altitude[0], azimuth[0]
+
+    def _sun_at(self, hour, minute):
+        from solweig_gpu.sun_position import sun_position
+        time = {'year': 2024, 'month': 5, 'day': 29, 'hour': hour, 'min': minute, 'sec': 0, 'UTC': self.UTC}
+        sun = sun_position(time, self.LOCATION)
+        return 90. - float(np.asarray(sun['zenith']).squeeze()), float(np.asarray(sun['azimuth']).squeeze())
+
+    def test_selected_hours_match_a_full_day(self):
+        # preprocess(hours=[4, 9, 12]) keeps only the 09:30, 14:30 and 17:30 IST rows. Each
+        # must get the sun of the same row in a full day, not one shifted by half the 5 h gap.
+        day = [(h, 30) for h in range(24)]
+        full_alt, full_azi = self._sun(day)
+        for picked in ([(9, 30), (14, 30), (17, 30)], [(14, 30)]):
+            alt, azi = self._sun(picked)
+            rows = [day.index(t) for t in picked]
+            np.testing.assert_allclose(alt, full_alt[rows])
+            np.testing.assert_allclose(azi, full_azi[rows])
+
+    def test_hourly_rows_use_the_middle_of_the_hour(self):
+        alt, azi = self._sun([(9, 30), (14, 30), (17, 30)])
+        for i, (hour, minute) in enumerate([(9, 0), (14, 0), (17, 0)]):
+            ref_alt, ref_azi = self._sun_at(hour, minute)
+            self.assertAlmostEqual(alt[i], ref_alt, places=6)
+            self.assertAlmostEqual(azi[i], ref_azi, places=6)
+
+    def test_half_hourly_rows_keep_a_15_minute_offset(self):
+        times = [(h, m) for h in range(8, 16) for m in (0, 30)]
+        alt, azi = self._sun(times)
+        for i, (hour, minute) in enumerate(times):
+            ref_alt, ref_azi = self._sun_at(*divmod(hour * 60 + minute - 15, 60))
+            self.assertAlmostEqual(alt[i], ref_alt, places=6)
+            self.assertAlmostEqual(azi[i], ref_azi, places=6)
+
+
 if __name__ == '__main__':
     unittest.main()

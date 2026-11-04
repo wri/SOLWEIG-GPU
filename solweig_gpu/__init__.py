@@ -20,3 +20,4 @@ from .solweig_gpu import (
     calculate_svf,
     run_utci_tiles,
 )
+from .postprocess import mosaic_tiles

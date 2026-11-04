@@ -59,6 +59,13 @@ def main():
     parser.add_argument('--dem', default='DEM.tif', help='DEM raster filename')
     parser.add_argument('--trees', default='Trees.tif', help='Trees raster filename')
     parser.add_argument('--landcover', default=None, help='Landcover raster filename (optional)')
+    parser.add_argument('--albedo', default=None,
+                        help='Ground albedo raster filename, fractions 0-1 (optional; replaces land-cover/default ground albedo)')
+    parser.add_argument('--baseline_albedo', default=None,
+                        help='Baseline albedo raster filename for cool-roof scenarios (optional; requires --albedo)')
+    parser.add_argument('--albedo_walls', type=float, default=0.2, help='Wall albedo (0-1)')
+    parser.add_argument('--albedo_ground', type=float, default=0.15,
+                        help='Ground albedo (0-1) used where there is neither land cover nor an albedo raster')
 
     # Tiling config
     parser.add_argument('--tile_size', type=int, default=3600, help='Tile size in pixels (e.g., 100–4000)')
@@ -82,6 +89,8 @@ def main():
     parser.add_argument('--save_lup', type=str2bool, default=False, help='Save upward longwave radiation output')
     parser.add_argument('--save_ldown', type=str2bool, default=False, help='Save downward longwave radiation output')
     parser.add_argument('--save_shadow', type=str2bool, default=False, help='Save shadow map output')
+    parser.add_argument('--clip_buildings', type=str2bool, default=True,
+                        help='Set building footprints (Building DSM - DEM >= 2 m) to NaN in the UTCI and Shadow outputs')
 
     args = parser.parse_args()
 
@@ -123,5 +132,10 @@ def main():
         save_kdown=args.save_kdown,
         save_lup=args.save_lup,
         save_ldown=args.save_ldown,
-        save_shadow=args.save_shadow
+        save_shadow=args.save_shadow,
+        clip_buildings=args.clip_buildings,
+        albedo_filename=args.albedo,
+        baseline_albedo_filename=args.baseline_albedo,
+        albedo_walls=args.albedo_walls,
+        albedo_ground=args.albedo_ground,
     )

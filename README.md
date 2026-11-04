@@ -74,7 +74,9 @@ For detailed documentation, see [Solweig-GPU Documentation](https://solweig-gpu.
 - SVF: Single-band raster
 - Other outputs: Multi-band raster (e.g., 24 bands for hourly results)
 
-If you need outputs in a different folder, set `base_path` to that directory and pass **complete paths** for the rasters: `building_dsm_filename`, `dem_filename`, `trees_filename`, and `landcover_filename` (optional).
+If you need outputs in a different folder, set `base_path` to that directory and pass **complete paths** for the rasters: `building_dsm_filename`, `dem_filename`, `trees_filename`, and the optional `landcover_filename`, `albedo_filename` and `baseline_albedo_filename`.
+
+An optional albedo raster (`albedo_filename`, fractions 0–1, any grid) replaces the ground albedo; `albedo_walls` (0.2) and `albedo_ground` (0.15) set the defaults; a baseline albedo raster adds the cool-roof air-temperature cut. See [Input Data – Albedo](docs/input_data.md#albedo-optional).
 
 ![UTCI for New Delhi](https://raw.githubusercontent.com/nvnsudharsan/solweig-gpu/main/UTCI_New_Delhi.jpeg)  
 *UTCI for New Delhi, India, generated using SOLWEIG-GPU and visualized with ArcGIS Online.*
@@ -156,6 +158,7 @@ thermal_comfort(
     dem_filename='DEM.tif',
     trees_filename='Trees.tif',
     landcover_filename=None,
+    albedo_filename=None,  # optional ground albedo raster (fractions 0-1)
     tile_size=1000,
     overlap=100,
     use_own_met=False,

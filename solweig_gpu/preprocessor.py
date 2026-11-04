@@ -32,6 +32,8 @@ from scipy.spatial import cKDTree
 import math
 from tqdm import tqdm
 import pytz
+from .albedo import align_to_grid, check_albedo_range, mean_albedo_change, write_air_temp_cut
+from .landcover import check_landcover_codes
 
 gdal.UseExceptions()
 RHO_CP = 1.225 * 1005.0  # air density * Cp
@@ -619,6 +621,15 @@ def process_era5_data_uhi(start_time, end_time, folder_path, output_file="Outfil
     keep = (times_pd >= pd.Timestamp(start_dt)) & (times_pd <= pd.Timestamp(end_dt))
     keep_idx = np.where(keep)[0]
 
+    if keep_idx.size == 0:
+        raise ValueError(
+            f"No ERA5 timestamps fall within the requested window "
+            f"[{start_dt} .. {end_dt}] UTC. The ERA5 files in {folder_path} cover "
+            f"{times_pd.min()} .. {times_pd.max()} UTC. Align selected_date_str / "
+            f"start_time / end_time with the data (or download ERA5 for the "
+            f"requested date)."
+        )
+
     times = times[keep_idx]
     temperatures = temperatures[keep_idx, :, :]
     dew_points = dew_points[keep_idx, :, :]
@@ -918,7 +929,7 @@ def _tile_size_m(poly):
     h = _haversine_m(miny, cx, maxy, cx) 
     return w, h
 
-def process_metfiles(netcdf_file, raster_folder, base_path, selected_date_str, preprocess_dir, use_uhi=True):
+def process_metfiles(netcdf_file, raster_folder, base_path, selected_date_str, preprocess_dir, use_uhi=True, hours=None):
 
     metfiles_folder = os.path.join(preprocess_dir, "metfiles")
     os.makedirs(metfiles_folder, exist_ok=True)
@@ -1041,8 +1052,18 @@ def process_metfiles(netcdf_file, raster_folder, base_path, selected_date_str, p
             idx for idx, dt in enumerate(time_base_date)
             if utc_start <= dt.replace(tzinfo=pytz.utc) <= utc_end
         ]
+
+        # Optionally keep only specific UTC hours-of-day. time_base_date entries are
+        # naive UTC (Outfile.nc time units are "hours since 1970-..."), so .hour is the
+        # UTC hour -- even though the metfile `it` column and output band labels below
+        # stay LOCAL. The [start_time, end_time] window must still span these hours.
+        if hours is not None:
+            hset = {int(h) for h in hours}
+            time_indices = [idx for idx in time_indices if time_base_date[idx].hour in hset]
+
         if not time_indices:
-            print(f"No UTC data found for local date {selected_date_str} in {tif_file}.")
+            hours_note = f" at UTC hours {sorted({int(h) for h in hours})}" if hours is not None else ""
+            print(f"No UTC data found for local date {selected_date_str}{hours_note} in {tif_file}.")
             ds_tif = None
             continue
 
@@ -1210,7 +1231,8 @@ def ppr(base_path, building_dsm_filename, dem_filename, trees_filename,
          landcover_filename, windcoeff_filename,
          tile_size, overlap, selected_date_str, use_own_met,
          start_time=None, end_time=None, data_source_type=None, data_folder=None,
-         own_met_file=None, preprocess_dir=None, use_uhi=True):
+         own_met_file=None, preprocess_dir=None, use_uhi=True, hours=None,
+         albedo_filename=None, baseline_albedo_filename=None):
     """
     Preprocessing routine to validate raster files, generate tiles, and prepare metfiles for SOLWEIG.
 
@@ -1232,6 +1254,17 @@ def ppr(base_path, building_dsm_filename, dem_filename, trees_filename,
         own_met_file (str): Path to user-provided met file (used if use_own_met is True).
         preprocess_dir (str): Directory for preprocessing outputs.
         use_uhi (bool): Whether to use UHI-aware ERA5 preprocessing.
+        hours (list[int]): Optional list of UTC hours-of-day (e.g. [4, 9, 12]) to
+            keep. If None, all timesteps in the window are used. Only affects the
+            ERA5/WRF metfile path; the [start_time, end_time] window must span the
+            requested hours.
+        albedo_filename (str): Filename of a ground albedo raster (fractions 0-1) or None.
+            It may be on any grid: it is resampled bilinearly onto the Building DSM
+            grid when needed, then tiled into {preprocess_dir}/Albedo.
+        baseline_albedo_filename (str): Filename of the baseline albedo raster or None.
+            Requires albedo_filename. The mean albedo increase over the domain sets
+            the cool-roof air-temperature cut, recorded in
+            {preprocess_dir}/Albedo/air_temp_cut.json for run_utci_tiles.
     """
     if preprocess_dir is None:
         preprocess_dir = os.path.join(base_path, "processed_inputs")
@@ -1243,12 +1276,20 @@ def ppr(base_path, building_dsm_filename, dem_filename, trees_filename,
 
     landcover_path = None
     windcoeff_path = None
+    albedo_path = None
+    baseline_albedo_path = None
 
     if landcover_filename is not None:
         landcover_path = os.path.join(base_path, landcover_filename)
 
     if windcoeff_filename is not None:
         windcoeff_path = os.path.join(base_path, windcoeff_filename)
+
+    if albedo_filename is not None:
+        albedo_path = os.path.join(base_path, albedo_filename)
+
+    if baseline_albedo_filename is not None:
+        baseline_albedo_path = os.path.join(base_path, baseline_albedo_filename)
 
     # Check that all rasters have matching dimensions, pixel size, and CRS.
     try:
@@ -1261,6 +1302,17 @@ def ppr(base_path, building_dsm_filename, dem_filename, trees_filename,
             raster_list.append(windcoeff_path)
 
         check_rasters(raster_list)
+
+        # Land cover in another scheme (e.g. OpenUrban) would otherwise run as bare soil.
+        if landcover_path is not None:
+            check_landcover_codes(landcover_path)
+
+        # Albedo rasters may be on any grid (they are resampled below) but must be fractions.
+        if baseline_albedo_path is not None and albedo_path is None:
+            raise ValueError("baseline_albedo_filename requires albedo_filename (the scenario albedo).")
+        for path in (albedo_path, baseline_albedo_path):
+            if path is not None:
+                check_albedo_range(path)
 
     except ValueError as error:
         print(error)
@@ -1278,9 +1330,38 @@ def ppr(base_path, building_dsm_filename, dem_filename, trees_filename,
     if windcoeff_path is not None:
         rasters["WindCoeff"] = windcoeff_path
 
+    # Albedo state from an earlier run must not leak into this one: create_tiles
+    # only replaces the folders of rasters given now.
+    albedo_dir = os.path.join(preprocess_dir, "Albedo")
+    aligned_albedo = os.path.join(preprocess_dir, "albedo_aligned.vrt")
+    aligned_baseline = os.path.join(preprocess_dir, "albedo_baseline_aligned.vrt")
+    for stale in (aligned_albedo, aligned_baseline):
+        if os.path.exists(stale):
+            os.remove(stale)
+    if albedo_path is None:
+        shutil.rmtree(albedo_dir, ignore_errors=True)
+    # Likewise for land cover and wind coefficients, which run_utci_tiles uses
+    # whenever their folder exists.
+    for tile_type, path in (("Landcover", landcover_path), ("WindCoeff", windcoeff_path)):
+        if path is None:
+            shutil.rmtree(os.path.join(preprocess_dir, tile_type), ignore_errors=True)
+
+    delta_albedo = None
+    if albedo_path is not None:
+        rasters["Albedo"] = align_to_grid(albedo_path, building_dsm_path, aligned_albedo)
+        if baseline_albedo_path is not None:
+            baseline_on_grid = align_to_grid(baseline_albedo_path, building_dsm_path, aligned_baseline)
+            delta_albedo = mean_albedo_change(rasters["Albedo"], baseline_on_grid)
+
     for tile_type, raster in rasters.items():
         print(f"Creating tiles for {tile_type}...")
         create_tiles(raster, tile_size, overlap, tile_type, preprocess_dir)
+
+    # Written after tiling because create_tiles recreates the Albedo folder.
+    if delta_albedo is not None:
+        cut = write_air_temp_cut(albedo_dir, delta_albedo, albedo_path, baseline_albedo_path)
+        print(f"[INFO] Mean albedo change vs baseline: {delta_albedo:+.4f}; "
+              f"cool-roof air-temperature cut at 12:00: {cut:.2f} °C")
 
     # For metfiles processing, we use the DEM tiles folder.
     dem_tiles_folder = os.path.join(preprocess_dir, "DEM")
@@ -1316,7 +1397,7 @@ def ppr(base_path, building_dsm_filename, dem_filename, trees_filename,
             exit(1)
 
         # Process the generated NetCDF file to create metfiles.
-        process_metfiles(processed_nc_file, dem_tiles_folder, base_path, selected_date_str, preprocess_dir, use_uhi=use_uhi)
+        process_metfiles(processed_nc_file, dem_tiles_folder, base_path, selected_date_str, preprocess_dir, use_uhi=use_uhi, hours=hours)
 
 
 

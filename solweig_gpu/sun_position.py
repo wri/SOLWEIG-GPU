@@ -929,10 +929,13 @@ def Solweig_2015a_metdata_noload(inputdata, location, UTC):
     data_len = len(met[:, 0])
     dectime = met[:, 1]+met[:, 2] / 24 + met[:, 3] / (60*24.)
     dectimemin = met[:, 3] / (60*24.)
-    if data_len == 1:
-        halftimestepdec = 0
-    else:
-        halftimestepdec = (dectime[1] - dectime[0]) / 2.
+    # Forcing rows are averages over the preceding step, so the sun is placed half a
+    # native step earlier. `hours` can keep non-adjacent rows (e.g. 04, 09, 12 UTC), so
+    # the gap between rows is not the native step: take the smallest gap, capped at
+    # one hour because ERA5/WRF forcing is hourly (sub-hourly own-met files keep theirs).
+    gaps = np.diff(dectime)
+    gaps = gaps[gaps > 0]
+    halftimestepdec = (min(gaps.min(), 1 / 24.) if gaps.size else 1 / 24.) / 2.
     time = dict()
     time['sec'] = 0
     time['UTC'] = UTC

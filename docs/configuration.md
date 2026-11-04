@@ -52,7 +52,26 @@ building_dsm_filename = 'Building_DSM.tif'  # Default; or e.g. '/data/rasters/Bu
 dem_filename = 'DEM.tif'                    # Default
 trees_filename = 'Trees.tif'                # Default
 landcover_filename = None                   # Optional
+albedo_filename = None                      # Optional ground albedo raster (0-1)
+baseline_albedo_filename = None             # Optional; cool-roof air-temperature cut
 ```
+
+## Albedo Configuration
+
+```python
+albedo_walls = 0.2    # Wall albedo
+albedo_ground = 0.15  # Ground albedo where there is neither land cover nor an albedo raster
+```
+
+An albedo raster (`albedo_filename`) replaces the land-cover or default ground albedo. A baseline albedo raster (`baseline_albedo_filename`) also lowers the forcing air temperature for cool-roof scenarios. See [Input Data – Albedo](input_data.md#albedo-optional).
+
+## Tree Transmissivity Configuration
+
+```python
+tree_transmissivity_pct = None  # e.g. 3: percent of light through tree canopies on every date
+```
+
+By default (`None`) trees are in leaf from day of year 98 to 299 (about 7 April to 26 October), when 3% of the light gets through the canopy, and leafless outside it, when 50% of the direct sun gets through: a temperate deciduous season. Pass a percentage from 0 to 100 to use it on every date, for both the direct sun and the diffuse sky light. For example, `3` keeps trees in leaf all year (evergreen or tropical trees). UTCI and Shadow outputs record the setting (see [Outputs – Tree Transmissivity Tag](outputs.md#tree-transmissivity-tag)), so a resumed run recomputes tiles written with another value.
 
 ## Tiling Configuration
 
@@ -194,11 +213,14 @@ save_kdown = False    # Downwelling shortwave radiation
 save_lup = False      # Upwelling longwave radiation
 save_ldown = False    # Downwelling longwave radiation
 save_shadow = False   # Shadow maps
+clip_buildings = True # NaN building footprints in UTCI and Shadow
 ```
 
 **Output Descriptions:**
 
  Except for the sky view factor, each output is saved as a multi-band GeoTIFF with one time step per band.
+
+**Building clipping:** with `clip_buildings=True` (the default), building footprints (Building DSM − DEM ≥ 2 m) are NaN in the UTCI and Shadow outputs. Set `clip_buildings=False` to keep the rooftop values. See [Outputs – Building clipping](outputs.md#building-clipping).
     
 ## Complete Configuration Example
 
@@ -217,6 +239,16 @@ thermal_comfort(
     dem_filename='DEM.tif',
     trees_filename='Trees.tif',
     landcover_filename='Landcover.tif',
+    albedo_filename=None,             # e.g. 'Albedo.tif' (fractions 0-1)
+    baseline_albedo_filename=None,    # cool-roof scenarios only
+    
+    # Albedo
+    albedo_walls=0.2,
+    albedo_ground=0.15,
+
+    # Percent of light through tree canopies on every date (e.g. 3 for tropical
+    # cities); None uses a temperate leaf season
+    tree_transmissivity_pct=None,
     
     # Tiling configuration
     tile_size=1000,
@@ -236,7 +268,8 @@ thermal_comfort(
     save_kdown=False,
     save_lup=False,
     save_ldown=False,
-    save_shadow=False
+    save_shadow=False,
+    clip_buildings=True
 )
 ```
 

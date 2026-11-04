@@ -13,12 +13,21 @@
 import os
 import numpy as np
 from osgeo import gdal
-from scipy.ndimage import rotate
+from scipy.ndimage import rotate, maximum_filter, correlate
 import math
+from functools import lru_cache
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 import time
 import gc
+
+try:
+    import torch
+    import torch.nn.functional as F
+    _TORCH_AVAILABLE = True
+except Exception:  # pragma: no cover - torch is a hard dependency in practice
+    _TORCH_AVAILABLE = False
+
 gdal.UseExceptions()
 
 # Wall height threshold
@@ -38,16 +47,13 @@ def findwalls(dem_array, walllimit):
     Returns:
         np.ndarray: 2D array of wall heights. Zero where no wall exists.
     """
-    col, row = dem_array.shape
-    walls = np.zeros((col, row))
-    domain = np.array([[0, 1, 0], [1, 0, 1], [0, 1, 0]])
-
-    for i in range(1, row - 1):
-        for j in range(1, col - 1):
-            dom = dem_array[j - 1:j + 2, i - 1:i + 2]
-            walls[j, i] = np.max(dom[domain == 1])
-
-    walls = walls - dem_array
+    # Wall height at each cell = (max of its 4 orthogonal neighbours) - itself.
+    # This is a maximum filter over the plus-shaped neighbourhood, so we use
+    # scipy's C-level maximum_filter instead of a per-pixel Python loop. The
+    # result is identical on the interior (the border is zeroed explicitly
+    # below, exactly as before) and is ~2-3 orders of magnitude faster.
+    domain = np.array([[0, 1, 0], [1, 0, 1], [0, 1, 0]], dtype=bool)
+    walls = maximum_filter(dem_array, footprint=domain, mode='nearest') - dem_array
     walls[walls < walllimit] = 0
 
     walls[:, 0] = 0
@@ -96,22 +102,19 @@ def get_ders(dsm, scale):
     asp[asp < 0] += 2 * np.pi
     return grad, asp
 
-def filter1Goodwin_as_aspect_v3(walls, scale, a):
+@lru_cache(maxsize=8)
+def _rotated_aspect_filters(scale):
     """
-    Calculate wall aspect (orientation) using directional filtering.
-    
-    This function determines the orientation of walls by rotating a directional
-    filter and finding the direction with maximum wall presence.
-    
-    Args:
-        walls (np.ndarray): Binary array indicating wall locations
-        scale (float): Pixel size in meters
-        a (np.ndarray): Aspect array from DSM derivatives
-    
+    Precompute the 180 rotated directional filters used for wall aspect.
+
+    The filters depend only on ``scale`` (through the derived ``filtersize``),
+    not on the DSM data, so they are identical for every tile of a given raster.
+    Building them once and caching avoids recomputing 360 rotations per tile.
+
     Returns:
-        np.ndarray: Wall aspect in degrees [0-360], where 0=North, 90=East, 180=South, 270=West
+        tuple: ``(f1_stack, b1_stack, b2_stack, index_arr, filthalveceil)``
+        where the three stacks have shape ``(180, filtersize, filtersize)``.
     """
-    row, col = a.shape
     filtersize = int(np.floor((scale + 1e-10) * 9))
     if filtersize <= 2:
         filtersize = 3
@@ -128,11 +131,7 @@ def filter1Goodwin_as_aspect_v3(walls, scale, a):
     buildfilt[filthalveceil - 1, :filthalvefloor] = 1
     buildfilt[filthalveceil - 1, filthalveceil:] = 2
 
-    y = np.zeros((row, col))
-    z = np.zeros((row, col))
-    x = np.zeros((row, col))
-    walls = (walls > 0).astype(np.uint8)
-
+    f1_stack, b1_stack, b2_stack, index_arr = [], [], [], []
     for h in range(0, 180):
         filtmatrix1 = np.round(rotate(filtmatrix, h, order=1, reshape=False, mode='nearest'))
         filtmatrixbuild = np.round(rotate(buildfilt, h, order=0, reshape=False, mode='nearest'))
@@ -145,40 +144,192 @@ def filter1Goodwin_as_aspect_v3(walls, scale, a):
         if index == 135:
             filtmatrix1[0, n] = filtmatrix1[n, 0] = 1
 
-        for i in range(filthalveceil - 1, row - filthalveceil - 1):
-            for j in range(filthalveceil - 1, col - filthalveceil - 1):
-                if walls[i, j] == 1:
-                    wallscut = walls[i - filthalvefloor:i + filthalvefloor + 1,
-                                     j - filthalvefloor:j + filthalvefloor + 1] * filtmatrix1
-                    dsmcut = a[i - filthalvefloor:i + filthalvefloor + 1,
-                               j - filthalvefloor:j + filthalvefloor + 1]
-                    if z[i, j] < wallscut.sum():
-                        z[i, j] = wallscut.sum()
-                        x[i, j] = 1 if np.sum(dsmcut[filtmatrixbuild == 1]) > np.sum(dsmcut[filtmatrixbuild == 2]) else 2
-                        y[i, j] = index
+        f1_stack.append(filtmatrix1)
+        b1_stack.append((filtmatrixbuild == 1).astype(np.float32))
+        b2_stack.append((filtmatrixbuild == 2).astype(np.float32))
+        index_arr.append(index)
 
+    return (np.asarray(f1_stack, dtype=np.float32),
+            np.asarray(b1_stack, dtype=np.float32),
+            np.asarray(b2_stack, dtype=np.float32),
+            np.asarray(index_arr, dtype=np.float32),
+            filthalveceil)
+
+
+def _side_offsets(mask, filthalvefloor):
+    """
+    ``(dr, dc)`` offsets of the cells of one build-filter side, in the C (row-
+    major) order that ``np.sum(dsm_window[mask])`` visits them. Matching this
+    order lets us reproduce the reference's float32 summation exactly.
+    """
+    fs = mask.shape[0]
+    return [(r - filthalvefloor, c - filthalvefloor)
+            for r in range(fs) for c in range(fs) if mask[r, c] > 0]
+
+
+def _winner_angle_map(walls, f1_stack, filthalveceil, use_gpu):
+    """
+    For every interior wall pixel, find the rotation angle whose line filter
+    overlaps the most wall cells. Returns an int array holding the winning angle
+    index per pixel, or ``-1`` where there is no wall or no overlap at any angle
+    (mirroring the reference's ``z < s`` guard, which never fires when every
+    angle gives 0).
+
+    The wall-count correlation of a 0/1 mask with a 0/1 kernel is an exact small
+    integer even in float32, so GPU and CPU yield identical winner maps, and the
+    running strict-``>`` update keeps the first (lowest-angle) winner exactly as
+    the reference loop does.
+    """
+    row, col = walls.shape
+    fs = f1_stack.shape[-1]
+    n_ang = f1_stack.shape[0]
+    wbin = (walls > 0)
+
+    if use_gpu:
+        device = 'cuda'
+        pad = fs // 2  # filtersize is always odd -> symmetric 'same' padding
+        wt = torch.as_tensor(wbin, dtype=torch.float32, device=device)[None, None]
+        kF1 = torch.as_tensor(f1_stack, device=device)[:, None]
+        z = torch.zeros((row, col), device=device)
+        win = torch.full((row, col), -1, dtype=torch.int64, device=device)
+        chunk = 16
+        while True:
+            try:
+                for s0 in range(0, n_ang, chunk):
+                    s1 = min(s0 + chunk, n_ang)
+                    wsum = F.conv2d(wt, kF1[s0:s1], padding=pad)[0]
+                    for c in range(s1 - s0):
+                        upd = wsum[c] > z
+                        z[upd] = wsum[c][upd]
+                        win[upd] = s0 + c
+                break
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                if chunk == 1:
+                    raise
+                chunk //= 2
+                z.zero_()
+                win.fill_(-1)
+        win = win.cpu().numpy()
+    else:
+        wbin_f = wbin.astype(np.float32)
+        z = np.zeros((row, col), dtype=np.float32)
+        win = np.full((row, col), -1, dtype=np.int64)
+        for h in range(n_ang):
+            wsum = correlate(wbin_f, f1_stack[h], mode='constant', cval=0.0)
+            upd = wsum > z
+            z[upd] = wsum[upd]
+            win[upd] = h
+
+    # The reference loop only ever visited interior wall pixels.
+    keep = np.zeros((row, col), dtype=bool)
+    keep[filthalveceil - 1:row - filthalveceil - 1,
+         filthalveceil - 1:col - filthalveceil - 1] = True
+    keep &= wbin
+    win[~keep] = -1
+    return win
+
+
+def _resolve_sides_exact(a, win, b1_stack, b2_stack, filthalveceil):
+    """
+    Decide the building side (``x`` = 1 or 2) for each winning wall pixel.
+
+    This reproduces the reference bit-for-bit: for a pixel's winning angle it
+    compares ``sum(dsm over the '1' cells)`` against ``sum(dsm over the '2'
+    cells)`` using the same float32 ``np.sum`` reduction order. Doing the sums
+    this way (rather than via conv/correlate) is what keeps genuinely near-tied
+    pixels from flipping 180 degrees, since any other summation order rounds a
+    near-tie the other way.
+    """
+    row, col = a.shape
+    fhf = b1_stack.shape[-1] // 2
+    x = np.zeros((row, col))
+    for h in np.unique(win[win >= 0]):
+        rows, cols = np.where(win == h)
+        o1 = _side_offsets(b1_stack[h], fhf)
+        o2 = _side_offsets(b2_stack[h], fhf)
+        # np.stack(..., axis=1) -> (n_pixels, n_cells), C-contiguous, so the
+        # inner-axis np.sum uses the same reduction as np.sum(dsm_window[mask]).
+        b1 = (np.sum(np.stack([a[rows + dr, cols + dc] for dr, dc in o1], axis=1), axis=1)
+              if o1 else np.zeros(rows.size, dtype=a.dtype))
+        b2 = (np.sum(np.stack([a[rows + dr, cols + dc] for dr, dc in o2], axis=1), axis=1)
+              if o2 else np.zeros(rows.size, dtype=a.dtype))
+        x[rows, cols] = np.where(b1 > b2, 1.0, 2.0)
+    return x
+
+
+def filter1Goodwin_as_aspect_v3(walls, scale, a):
+    """
+    Calculate wall aspect (orientation) using directional filtering.
+
+    This function determines the orientation of walls by rotating a directional
+    filter and finding the direction with maximum wall presence.
+
+    Args:
+        walls (np.ndarray): Binary array indicating wall locations
+        scale (float): Pixel size in meters
+        a (np.ndarray): Aspect array from DSM derivatives
+
+    Returns:
+        np.ndarray: Wall aspect in degrees [0-360], where 0=North, 90=East, 180=South, 270=West
+
+    Notes:
+        The reference's per-angle, per-pixel loop is split into two exact,
+        vectorised steps: (1) a winning-angle argmax via wall-count correlation
+        (batched ``conv2d`` on the GPU when CUDA is available, else
+        ``scipy.ndimage`` on the CPU), and (2) the building-side decision, which
+        is resolved with the reference's own float32 ``np.sum`` over the winning
+        angle's cells. Both steps reproduce the original output bit-for-bit.
+    """
+    f1_stack, b1_stack, b2_stack, index_arr, filthalveceil = \
+        _rotated_aspect_filters(float(scale))
+
+    use_gpu = _TORCH_AVAILABLE and torch.cuda.is_available()
+    win = _winner_angle_map(walls, f1_stack, filthalveceil, use_gpu)
+    x = _resolve_sides_exact(a, win, b1_stack, b2_stack, filthalveceil)
+
+    y = np.where(win >= 0, index_arr[np.maximum(win, 0)], 0.0).astype(np.float64)
     y[x == 1] -= 180
     y[y < 0] += 360
 
     grad, asp = get_ders(a, scale)
-    y += ((walls == 1) & (y == 0)) * (asp / (math.pi / 180.))
+    y += ((walls > 0) & (y == 0)) * (asp / (math.pi / 180.))
 
     return y
+
+def _tile_key_from_dsm(filename):
+    """
+    Extract the tile key from a Building_DSM tile filename.
+
+    The prefix ``Building_DSM_`` is 13 characters, so e.g.
+    ``Building_DSM_0_0.tif`` -> ``0_0``.
+    """
+    return filename[13:-4]
 
 def process_file_parallel(args):
     """
     Process a single DEM tile to calculate walls and aspect (parallel worker function).
-    
+
     This function is designed to be called by parallel processing workers.
-    
+
     Args:
-        args (tuple): (filename, dem_folder_path, wall_output_path, aspect_output_path)
-    
+        args (tuple): (filename, dem_folder_path, wall_output_path,
+            aspect_output_path, overwrite)
+
     Returns:
         str: Filename of processed tile
     """
-    filename, dem_folder_path, wall_output_path, aspect_output_path = args
+    filename, dem_folder_path, wall_output_path, aspect_output_path, overwrite = args
     dem_path = os.path.join(dem_folder_path, filename)
+
+    # Walls and aspect depend only on geometry (not time), so skip tiles that
+    # already have both outputs unless an overwrite was explicitly requested.
+    key = _tile_key_from_dsm(filename)
+    wall_out_path = os.path.join(wall_output_path, f"walls_{key}.tif")
+    aspect_out_path = os.path.join(aspect_output_path, f"aspect_{key}.tif")
+
+    if (not overwrite) and os.path.exists(wall_out_path) and os.path.exists(aspect_out_path):
+        return filename
 
     dataset = None
     try:
@@ -208,9 +359,7 @@ def process_file_parallel(args):
         aspects = filter1Goodwin_as_aspect_v3(walls, scale, a)
 
         driver = gdal.GetDriverByName('GTiff')
-        out_names = [f"walls_{filename[13:-4]}.tif", f"aspect_{filename[13:-4]}.tif"]
-        out_paths = [os.path.join(wall_output_path, out_names[0]),
-                     os.path.join(aspect_output_path, out_names[1])]
+        out_paths = [wall_out_path, aspect_out_path]
 
         for out_path, data in zip(out_paths, [walls, aspects]):
             # Retry logic for Windows file locking issues
@@ -268,18 +417,21 @@ def process_file_parallel(args):
             dataset = None
         return filename
 
-def run_parallel_processing(dem_folder_path, wall_output_path, aspect_output_path):
+def run_parallel_processing(dem_folder_path, wall_output_path, aspect_output_path, overwrite=False):
     """
     Process all DEM tiles in parallel to calculate walls and aspects.
-    
+
     This is the main entry point for wall and aspect calculation. It uses
     multiprocessing to process multiple tiles simultaneously for efficiency.
-    
+
     Args:
         dem_folder_path (str): Path to folder containing DEM tile GeoTIFFs
         wall_output_path (str): Output path for wall height rasters
         aspect_output_path (str): Output path for wall aspect rasters
-    
+        overwrite (bool): If False (default), tiles that already have both a
+            walls and an aspect output are skipped and reused. Set True to force
+            recomputation (e.g. after changing tile_size/overlap or the inputs).
+
     Notes:
         - Uses multiple CPU cores for parallel processing
         - On Windows, uses fewer workers (max 8 or half of CPU cores) to avoid file locking issues
@@ -291,8 +443,30 @@ def run_parallel_processing(dem_folder_path, wall_output_path, aspect_output_pat
     os.makedirs(aspect_output_path, exist_ok=True)
 
     dem_files = [f for f in os.listdir(dem_folder_path) if f.endswith('.tif') and not f.startswith('.')]
-    args_list = [(f, dem_folder_path, wall_output_path, aspect_output_path) for f in dem_files]
 
+    if not overwrite:
+        reused = sum(
+            1 for f in dem_files
+            if os.path.exists(os.path.join(wall_output_path, f"walls_{_tile_key_from_dsm(f)}.tif"))
+            and os.path.exists(os.path.join(aspect_output_path, f"aspect_{_tile_key_from_dsm(f)}.tif"))
+        )
+        if reused:
+            print(f"Reusing {reused}/{len(dem_files)} existing walls/aspect tiles (overwrite=False)")
+
+    args_list = [(f, dem_folder_path, wall_output_path, aspect_output_path, overwrite) for f in dem_files]
+
+    # When a CUDA GPU is available the aspect step runs on it (batched conv2d).
+    # A single process must own the device -- many workers contending for one
+    # GPU is slower and can OOM -- and each tile now takes only a few seconds,
+    # so tiles are processed sequentially in-process.
+    if _TORCH_AVAILABLE and torch.cuda.is_available():
+        print("Computing Wall Height and Aspect on GPU (sequential over tiles)")
+        for args in tqdm(args_list, total=len(args_list), desc="Computing Wall Height and Aspect", mininterval=1):
+            process_file_parallel(args)
+        return
+
+    # CPU fallback: the aspect step is vectorised (scipy correlate) but still
+    # CPU-bound, so fan tiles out across processes as before.
     # On Windows, use fewer workers to avoid file locking issues
     # Reduce max_workers to prevent excessive concurrent file access
     cpu_count = os.cpu_count() or 1

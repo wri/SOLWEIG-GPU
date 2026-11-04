@@ -49,6 +49,9 @@ setup(
             "pytest",
             "pytest-cov",
         ],
+        "download": [
+            "cdsapi",
+        ],
     },
     license="GPL-3.0-only",
     classifiers=[
@@ -64,6 +67,7 @@ setup(
             'solweig_gpu=solweig_gpu.cli:main',
             'thermal_comfort=solweig_gpu.cli:main',
             'solweig_gpu_gui=solweig_gpu.solweig_gpu_gui:main',
+            'solweig_download_era5=solweig_gpu.download_era5:main',
         ],
     },
 )

@@ -156,12 +156,126 @@ def save_svf_zip_npz_outputs(output_dir, gdal_dsm, svf, svfE, svfS, svfW, svfN, 
 
     save_raster_like_gdal(gdal_dsm, svftotal_path, svftotal)
 
-    np.savez_compressed(
-        npz_path,
-        shadowmat=tensor_to_numpy(shmat).astype(np.float32),
-        vegshadowmat=tensor_to_numpy(vegshmat).astype(np.float32),
-        vbshmat=tensor_to_numpy(vbshvegshmat).astype(np.float32),
-    )
+    mats = {
+        "shadowmat": np.asarray(tensor_to_numpy(shmat), dtype=np.float32),
+        "vegshadowmat": np.asarray(tensor_to_numpy(vegshmat), dtype=np.float32),
+        "vbshmat": np.asarray(tensor_to_numpy(vbshvegshmat), dtype=np.float32),
+    }
+    # Same arrays, same npz keys, still a np.load-compatible npz — only the
+    # archive's deflate level changes. np.savez_compressed hardwires zlib level 6,
+    # which costs 10-25 s/tile on the ~2 GB 0/1 shadow-mat trio; level 1
+    # compresses these masks nearly as well at a fraction of the CPU cost.
+    # Set SOLWEIG_NPZ_COMPRESSLEVEL=default to restore np.savez_compressed.
+    _level = os.environ.get("SOLWEIG_NPZ_COMPRESSLEVEL", "1")
+    if _level == "default":
+        np.savez_compressed(npz_path, **mats)
+    else:
+        with zipfile.ZipFile(npz_path, "w", zipfile.ZIP_DEFLATED,
+                             compresslevel=int(_level)) as zf:
+            for _name, _arr in mats.items():
+                with zf.open(_name + ".npy", "w", force_zip64=True) as _f:
+                    np.lib.format.write_array(_f, _arr, allow_pickle=False)
+
+def _shadow_core(f, temp, a, tempvegdem, tempvegdem2, vegsh, vbshvegsh):
+    """
+    Per-march-step elementwise core (operates on fixed full-tile shapes).
+    Extracted so torch.compile can fuse these ~8 memory-bound elementwise ops into
+    1-2 kernels; the dynamic int()/slice shifting stays in the eager caller.
+    Functionally identical to the original in-place updates.
+    """
+    f = torch.max(f, temp)
+    sh = (f > a).float()                              # sh[f>a]=1.; sh[f<=a]=0.
+    fabovea = tempvegdem > a
+    gabovea = tempvegdem2 > a
+    vegsh2 = fabovea.float() - gabovea.float()
+    vegsh = torch.max(vegsh, vegsh2)
+    vegsh = vegsh.masked_fill(vegsh * sh > 0., 0.0)   # vegsh[(vegsh*sh>0.)]=0.
+    vbshvegsh = vegsh + vbshvegsh
+    return f, sh, fabovea, vegsh, vbshvegsh
+
+
+# Fixed shapes per tile -> compiles once and is replayed for every march step.
+# Set SOLWEIG_COMPILE_MARCH=0 to force the eager path (for A/B benchmarking).
+if torch.cuda.is_available() and os.environ.get("SOLWEIG_COMPILE_MARCH", "1") == "1":
+    try:
+        import torch._dynamo
+        # Unattended run: if some tile shape ever fails to compile, fall back to
+        # eager for that shape instead of crashing the whole job.
+        torch._dynamo.config.suppress_errors = True
+        _shadow_core_dispatch = torch.compile(_shadow_core, dynamic=False)
+    except Exception as _e:  # pragma: no cover
+        print(f"[WARN] torch.compile unavailable ({_e}); using eager march core.")
+        _shadow_core_dispatch = _shadow_core
+else:
+    _shadow_core_dispatch = _shadow_core
+
+
+def _batch_step_fast(f, vegsh, vbshvegsh, a, vegdem, vegdem2, rows, cols, dxi, dyi, dz, m):
+    """
+    One batched march step (steps >= 2), fast-freeze variant (requires a.min()>=0):
+    per-lane shift indices + bounds mask + 3 shifted gathers + _shadow_core, with
+    only the vbshvegsh accumulator masked by the per-lane active mask `m`.
+    Bit-identical op sequence to shadow_batch's eager while-loop body; kept
+    tensor-only (no Python scalars that vary per step) so torch.compile records
+    ONE graph per (P,H,W) shape and replays it for every step.
+    """
+    H, W = a.shape[0], a.shape[1]
+    src_r = rows[None, :] + dxi[:, None]                     # (P,H)
+    src_c = cols[None, :] + dyi[:, None]                     # (P,W)
+    valid = ((src_r >= 0) & (src_r < H))[:, :, None] & ((src_c >= 0) & (src_c < W))[:, None, :]
+    idx_r = src_r.clamp(0, H - 1)[:, :, None]                # (P,H,1)
+    idx_c = src_c.clamp(0, W - 1)[:, None, :]                # (P,1,W)
+    dz3 = dz[:, None, None]
+    zero = torch.zeros((), device=a.device)
+    temp = torch.where(valid, a[idx_r, idx_c] - dz3, zero)
+    tempvegdem = torch.where(valid, vegdem[idx_r, idx_c] - dz3, zero)
+    tempvegdem2 = torch.where(valid, vegdem2[idx_r, idx_c] - dz3, zero)
+    nf, nsh, _fab, nvegsh, nvbsh = _shadow_core(f, temp, a, tempvegdem, tempvegdem2, vegsh, vbshvegsh)
+    nvbsh = torch.where(m[:, None, None], nvbsh, vbshvegsh)
+    return nf, nsh, nvegsh, nvbsh
+
+
+def _batch_step_full(f, sh, vegsh, vbshvegsh, a, vegdem, vegdem2, rows, cols, dxi, dyi, dz, m):
+    """4-way-freeze variant of _batch_step_fast (used when a.min() < 0)."""
+    H, W = a.shape[0], a.shape[1]
+    src_r = rows[None, :] + dxi[:, None]
+    src_c = cols[None, :] + dyi[:, None]
+    valid = ((src_r >= 0) & (src_r < H))[:, :, None] & ((src_c >= 0) & (src_c < W))[:, None, :]
+    idx_r = src_r.clamp(0, H - 1)[:, :, None]
+    idx_c = src_c.clamp(0, W - 1)[:, None, :]
+    dz3 = dz[:, None, None]
+    zero = torch.zeros((), device=a.device)
+    temp = torch.where(valid, a[idx_r, idx_c] - dz3, zero)
+    tempvegdem = torch.where(valid, vegdem[idx_r, idx_c] - dz3, zero)
+    tempvegdem2 = torch.where(valid, vegdem2[idx_r, idx_c] - dz3, zero)
+    nf, nsh, _fab, nvegsh, nvbsh = _shadow_core(f, temp, a, tempvegdem, tempvegdem2, vegsh, vbshvegsh)
+    m3 = m[:, None, None]
+    return (torch.where(m3, nf, f), torch.where(m3, nsh, sh),
+            torch.where(m3, nvegsh, vegsh), torch.where(m3, nvbsh, vbshvegsh))
+
+
+# Compile the whole batched step as ONE graph per (P,H,W) shape: the gathers fuse
+# with the subtract/where and the core, collapsing ~180 eager kernel launches per
+# step into a handful. Every op is elementwise/gather/compare (no a*b+c pattern),
+# so inductor cannot FMA-contract anything: bit-identical to eager. Set
+# SOLWEIG_COMPILE_BATCH=0 to force the eager step (A/B benchmarking).
+if torch.cuda.is_available() and os.environ.get("SOLWEIG_COMPILE_BATCH", "1") == "1":
+    try:
+        import torch._dynamo
+        torch._dynamo.config.suppress_errors = True
+        # Unpadded tail batches can produce ~9 distinct P shapes per tile size;
+        # keep headroom so shape churn never evicts hot graphs.
+        torch._dynamo.config.cache_size_limit = max(64, torch._dynamo.config.cache_size_limit)
+        _batch_step_fast_dispatch = torch.compile(_batch_step_fast, dynamic=False)
+        _batch_step_full_dispatch = torch.compile(_batch_step_full, dynamic=False)
+    except Exception as _e:  # pragma: no cover
+        print(f"[WARN] torch.compile unavailable ({_e}); using eager batch step.")
+        _batch_step_fast_dispatch = _batch_step_fast
+        _batch_step_full_dispatch = _batch_step_full
+else:
+    _batch_step_fast_dispatch = _batch_step_fast
+    _batch_step_full_dispatch = _batch_step_full
+
 
 def shadow(amaxvalue, a, vegdem, vegdem2, bush, azimuth, altitude, scale):
     """
@@ -222,6 +336,9 @@ def shadow(amaxvalue, a, vegdem, vegdem2, bush, azimuth, altitude, scale):
     f = a.clone()
     g = torch.zeros((sizex, sizey), device=device)
     bushplant = (bush > 1.).float()
+    # Evaluate once as a Python bool (single host sync) so the per-march-step
+    # guards below short-circuit without a GPU->CPU sync on every iteration.
+    bush_present = bool(bush.max() > 0.)
     vegsh = torch.zeros((sizex, sizey), device=device) + bushplant
 
     pibyfour = torch.pi / 4.
@@ -239,8 +356,6 @@ def shadow(amaxvalue, a, vegdem, vegdem2, bush, azimuth, altitude, scale):
 
     index = 1
     fabovea = None
-    gabovea = None
-    vegsh2 = None
 
     while (amaxvalue >= dz and torch.abs(dx) < sizex and torch.abs(dy) < sizey):
         if (pibyfour <= azimuth < threetimespibyfour or fivetimespibyfour <= azimuth < seventimespibyfour):
@@ -272,18 +387,9 @@ def shadow(amaxvalue, a, vegdem, vegdem2, bush, azimuth, altitude, scale):
         tempvegdem2[xp1:xp2, yp1:yp2] = vegdem2[xc1:xc2, yc1:yc2] - dz
         temp[xp1:xp2, yp1:yp2] = a[xc1:xc2, yc1:yc2] - dz
 
-        f = torch.max(f, temp)
-        sh[f > a] = 1.
-        sh[f <= a] = 0.
-
-        fabovea = tempvegdem > a
-        gabovea = tempvegdem2 > a
-        vegsh2 = fabovea.float() - gabovea.float()
-
-        vegsh = torch.max(vegsh, vegsh2)
-        vegsh[(vegsh * sh > 0.)] = 0.
-
-        vbshvegsh = vegsh + vbshvegsh
+        f, sh, fabovea, vegsh, vbshvegsh = _shadow_core_dispatch(
+            f, temp, a, tempvegdem, tempvegdem2, vegsh, vbshvegsh
+        )
 
         if index == 1.:
             firstvegdem = tempvegdem - temp
@@ -292,9 +398,9 @@ def shadow(amaxvalue, a, vegdem, vegdem2, bush, azimuth, altitude, scale):
             vegsh = vegsh * (vegdem2 > a).float()
             vbshvegsh.zero_()
 
-        if bush.max() > 0. and torch.max(fabovea * bush) > 0.:
+        if bush_present and torch.max(fabovea * bush) > 0.:
             tempbush.zero_()
-            tempbush[int(xp1)-1:int(xp2), int(yp1)-1:int(yp2)] = bush[int(xc1)-1:int(xc2), int(yc1)-1:int(yc2)] - dz
+            tempbush[xp1:xp2, yp1:yp2] = bush[xc1:xc2, yc1:yc2] - dz
             g = torch.max(g, tempbush)
             g *= bushplant
 
@@ -304,7 +410,7 @@ def shadow(amaxvalue, a, vegdem, vegdem2, bush, azimuth, altitude, scale):
     vbshvegsh[vbshvegsh > 0.] = 1.
     vbshvegsh = vbshvegsh - vegsh
 
-    if bush.max() > 0.:
+    if bush_present:
         g = g - bush
         g[g > 0.] = 1.
         g[g < 0.] = 0.
@@ -315,11 +421,182 @@ def shadow(amaxvalue, a, vegdem, vegdem2, bush, azimuth, altitude, scale):
     vegsh = 1. - vegsh
     vbshvegsh = 1. - vbshvegsh
 
-    # Changed here
-    del tempvegdem, tempvegdem2, temp, tempbush, fabovea, gabovea, vegsh2
-    torch.cuda.empty_cache()
-    # Changed here
+    del tempvegdem, tempvegdem2, temp, tempbush, fabovea
     return sh, vegsh, vbshvegsh
+
+
+def shadow_batch(amaxvalue, a, vegdem, vegdem2, azimuths, altitude, scale, pad_to=None):
+    """
+    Batched equivalent of shadow() for P sky patches that share one altitude
+    (different azimuths). Returns (sh, vegsh, vbshvegsh), each (P, H, W).
+
+    Bush-free path only: the caller guarantees bush.max()==0, so shadow()'s bush
+    branch is omitted. Every other step is reproduced *exactly* — the integer
+    slice+zero-fill `temp[dst]=src[src]-dz` becomes an integer gather
+    `temp[p]=where(valid, a[r+dx_p, c+dy_p]-dz_p, 0)`, and the per-patch ragged
+    march termination is handled with an active mask (required because vbshvegsh
+    accumulates every step).
+
+    pad_to: when set and > P, the batch is padded to exactly `pad_to` lanes by
+    duplicating the last azimuth (outputs sliced back to P). Lanes are fully
+    independent (per-lane gathers + elementwise ops only) and a duplicate lane
+    has an identical termination column, so no real lane's output nor the march
+    length can change; the only purpose is a FIXED (P,H,W) shape so the compiled
+    step records one graph per tile instead of one per tail-batch size.
+    """
+    device = a.device
+    H, W = a.shape[0], a.shape[1]
+    P = int(azimuths.shape[0])
+
+    deg = torch.pi / 180.0
+    az = azimuths.to(device=device, dtype=torch.float32).clone()
+    az = torch.where(az == 0.0, torch.full_like(az, 1e-12), az)   # match shadow(): 0 -> 1e-12
+    P_real = P
+    if pad_to is not None and int(pad_to) > P:
+        az = torch.cat([az, az[-1:].expand(int(pad_to) - P)])
+        P = int(pad_to)
+    az_rad = az * deg
+    tanaltbyscale = torch.tan(altitude * deg) / scale             # scalar tensor
+
+    sinaz = torch.sin(az_rad); cosaz = torch.cos(az_rad); tanaz = torch.tan(az_rad)
+    signsin = torch.sign(sinaz); signcos = torch.sign(cosaz)
+    dssin = torch.abs(1.0 / sinaz); dscos = torch.abs(1.0 / cosaz)
+
+    pibyfour = torch.pi / 4.0
+    cond = ((az_rad >= pibyfour) & (az_rad < 3.0 * pibyfour)) | \
+           ((az_rad >= 5.0 * pibyfour) & (az_rad < 7.0 * pibyfour))
+
+    rows = torch.arange(H, device=device)
+    cols = torch.arange(W, device=device)
+    zero = torch.zeros((), device=device)
+    one = torch.ones((), device=device)
+
+    f = a.unsqueeze(0).expand(P, H, W).clone()                   # carried state (P,H,W)
+    sh = torch.zeros((P, H, W), device=device)
+    vegsh = torch.zeros((P, H, W), device=device)
+    vbshvegsh = torch.zeros((P, H, W), device=device)
+
+    # When elevations are non-negative (absolute DSM), a terminated patch's next-step core outputs
+    # (nf/nsh/nvegsh) already equal its frozen values: temp<=0 <= f, so f/sh/vegsh don't move. Only
+    # vbshvegsh (an accumulator) keeps drifting and needs the freeze mask. This lets us skip 3 of the
+    # 4 per-step (P,H,W) torch.where masks. Bit-identical; falls back to the full freeze if a<0.
+    # Set SOLWEIG_FAST_FREEZE=0 to force the original 4-way freeze (A/B benchmarking).
+    fast_freeze = bool(a.min() >= 0) and os.environ.get("SOLWEIG_FAST_FREEZE", "1") == "1"
+
+    max_steps = 2 * max(H, W) + 2                                # loop guard
+
+    # Schedule-driven march (default): dx/dy/dz/active are closed-form in
+    # (lane, step), so precompute the whole schedule with the SAME torch f32 ops
+    # the while-loop uses (bit-identical per step, incl. `signsin * float(index)`
+    # since every index <= max_steps is exact in f32) and derive the step count
+    # with ONE host sync per batch instead of a bool(active.any()) sync per step.
+    # Per-lane termination is prefix-monotone (dz strictly increases, |dxi|/|dyi|
+    # non-decreasing), so `alive` rows are True-prefixed and the while-loop's
+    # step count equals (# any-True rows) + 1, capped by the guard.
+    # Set SOLWEIG_BATCH_SCHEDULE=0 to restore the stepwise loop (A/B benchmarking).
+    if os.environ.get("SOLWEIG_BATCH_SCHEDULE", "1") == "1":
+        k = torch.arange(1.0, float(max_steps) + 1.0, device=device, dtype=torch.float32)[:, None]
+        dy_all = torch.where(cond, signsin * k, signsin * torch.abs(torch.round(k * tanaz)))
+        dx_all = torch.where(cond, -1.0 * signcos * torch.abs(torch.round(k / tanaz)), -1.0 * signcos * k)
+        ds = torch.where(cond, dssin, dscos)
+        dz_all = ds * k * tanaltbyscale                          # (S,P), assoc matches ds*idxf*tanaltbyscale
+        dxi_all = dx_all.round().to(torch.long)
+        dyi_all = dy_all.round().to(torch.long)
+        alive = (amaxvalue >= dz_all) & (dxi_all.abs() < H) & (dyi_all.abs() < W)
+        S_run = min(int(alive.any(dim=1).sum().item()) + 1, max_steps)
+
+        for index in range(1, S_run + 1):
+            dxi = dxi_all[index - 1]
+            dyi = dyi_all[index - 1]
+            dz = dz_all[index - 1]
+            if index == 1:
+                # Eager first step: the firstvegdem block below needs temp and
+                # tempvegdem, and the freeze mask is all-True at step 1 (a
+                # torch.where with an all-True mask is a bitwise identity), so
+                # core outputs are assigned directly.
+                src_r = rows[None, :] + dxi[:, None]
+                src_c = cols[None, :] + dyi[:, None]
+                valid = ((src_r >= 0) & (src_r < H))[:, :, None] & ((src_c >= 0) & (src_c < W))[:, None, :]
+                idx_r = src_r.clamp_(0, H - 1)[:, :, None]
+                idx_c = src_c.clamp_(0, W - 1)[:, None, :]
+                dz3 = dz[:, None, None]
+                temp = torch.where(valid, a[idx_r, idx_c] - dz3, zero)
+                tempvegdem = torch.where(valid, vegdem[idx_r, idx_c] - dz3, zero)
+                tempvegdem2 = torch.where(valid, vegdem2[idx_r, idx_c] - dz3, zero)
+                f, sh, _fab, vegsh, vbshvegsh = _shadow_core(
+                    f, temp, a, tempvegdem, tempvegdem2, vegsh, vbshvegsh
+                )
+                firstvegdem = tempvegdem - temp
+                firstvegdem = torch.where(firstvegdem <= 0.0, torch.full_like(firstvegdem, 1000.0), firstvegdem)
+                vegsh = torch.where(firstvegdem < dz3, one, vegsh)
+                vegsh = vegsh * (vegdem2 > a).float()
+                vbshvegsh = torch.zeros_like(vbshvegsh)
+                del temp, tempvegdem, tempvegdem2, firstvegdem
+            elif fast_freeze:
+                f, sh, vegsh, vbshvegsh = _batch_step_fast_dispatch(
+                    f, vegsh, vbshvegsh, a, vegdem, vegdem2, rows, cols,
+                    dxi, dyi, dz, alive[index - 2]
+                )
+            else:
+                f, sh, vegsh, vbshvegsh = _batch_step_full_dispatch(
+                    f, sh, vegsh, vbshvegsh, a, vegdem, vegdem2, rows, cols,
+                    dxi, dyi, dz, alive[index - 2]
+                )
+    else:
+        active = torch.ones(P, dtype=torch.bool, device=device)  # in-bounds at step 0
+        index = 1
+        while index <= max_steps and bool(active.any()):
+            idxf = float(index)
+            dy = torch.where(cond, signsin * idxf, signsin * torch.abs(torch.round(idxf * tanaz)))
+            dx = torch.where(cond, -1.0 * signcos * torch.abs(torch.round(idxf / tanaz)), -1.0 * signcos * idxf)
+            ds = torch.where(cond, dssin, dscos)
+            dz = ds * idxf * tanaltbyscale                       # (P,)
+
+            dxi = dx.round().to(torch.long)
+            dyi = dy.round().to(torch.long)
+            src_r = rows[None, :] + dxi[:, None]                 # (P,H)
+            src_c = cols[None, :] + dyi[:, None]                 # (P,W)
+            valid = ((src_r >= 0) & (src_r < H))[:, :, None] & ((src_c >= 0) & (src_c < W))[:, None, :]
+            idx_r = src_r.clamp_(0, H - 1)[:, :, None]           # (P,H,1)
+            idx_c = src_c.clamp_(0, W - 1)[:, None, :]           # (P,1,W)
+            dz3 = dz[:, None, None]
+
+            temp = torch.where(valid, a[idx_r, idx_c] - dz3, zero)   # (P,H,W), exact vs slice+zero_
+            tempvegdem = torch.where(valid, vegdem[idx_r, idx_c] - dz3, zero)
+            tempvegdem2 = torch.where(valid, vegdem2[idx_r, idx_c] - dz3, zero)
+
+            nf, nsh, _fab, nvegsh, nvbsh = _shadow_core(f, temp, a, tempvegdem, tempvegdem2, vegsh, vbshvegsh)
+
+            m = active[:, None, None]                            # freeze terminated patches
+            if fast_freeze:
+                # nf/nsh/nvegsh == frozen values for terminated patches (a>=0), so update in place and
+                # only mask the accumulator.
+                f, sh, vegsh = nf, nsh, nvegsh
+                vbshvegsh = torch.where(m, nvbsh, vbshvegsh)
+            else:
+                f = torch.where(m, nf, f)
+                sh = torch.where(m, nsh, sh)
+                vegsh = torch.where(m, nvegsh, vegsh)
+                vbshvegsh = torch.where(m, nvbsh, vbshvegsh)
+
+            if index == 1:
+                firstvegdem = tempvegdem - temp
+                firstvegdem = torch.where(firstvegdem <= 0.0, torch.full_like(firstvegdem, 1000.0), firstvegdem)
+                vegsh = torch.where(firstvegdem < dz3, one, vegsh)
+                vegsh = vegsh * (vegdem2 > a).float()
+                vbshvegsh = torch.zeros_like(vbshvegsh)
+
+            active = (amaxvalue >= dz) & (dxi.abs() < H) & (dyi.abs() < W)   # in-bounds now -> active next
+            index += 1
+
+    sh = 1.0 - sh
+    vbshvegsh = torch.where(vbshvegsh > 0.0, one, vbshvegsh)
+    vbshvegsh = vbshvegsh - vegsh
+    vegsh = torch.where(vegsh > 0.0, one, vegsh)
+    vegsh = 1.0 - vegsh
+    vbshvegsh = 1.0 - vbshvegsh
+    return sh[:P_real], vegsh[:P_real], vbshvegsh[:P_real]
+
 
 def annulus_weight(altitude, aziinterval, device=None):
     """
@@ -506,7 +783,19 @@ def svf_calculator(patch_option, amaxvalue=None, a=None, vegdem=None, vegdem2=No
     device = a.device
     rows = a.shape[0]
     cols = a.shape[1]
-    
+
+    # Termination ceiling: the march only needs to span the true surface height RANGE. Once dz
+    # exceeds it, every remaining step is a provable no-op for the (binarized) shadow outputs, so
+    # capping the loop there is bit-identical while dropping the long tail of wasted steps that the
+    # original `amaxvalue` (an ABSOLUTE elevation) marched through. The maximum() guard stays exact
+    # even if a building sits under canopy (vegdem.max > amaxvalue). Set SOLWEIG_MARCH_CEILING=0 to
+    # restore the original absolute ceiling (A/B benchmarking). Elevations themselves are untouched.
+    hmin = a.min()
+    if os.environ.get("SOLWEIG_MARCH_CEILING", "1") == "1":
+        march_ceiling = torch.maximum(amaxvalue, vegdem.max()) - hmin
+    else:
+        march_ceiling = amaxvalue
+
     svf = torch.zeros([rows, cols], device=device)
     svfE = torch.zeros([rows, cols], device=device)
     svfS = torch.zeros([rows, cols], device=device)
@@ -541,46 +830,127 @@ def svf_calculator(patch_option, amaxvalue=None, a=None, vegdem=None, vegdem2=No
 
     aziintervalaniso = torch.ceil(aziinterval / 2.0)
 
+    # Precompute per-altitude-band annulus weight sums once. annulus_weight(k, .)
+    # is a pixel-independent scalar, so summing weight*sh over the ring index k is
+    # (sum_k weight) * sh -- collapsing the inner per-patch loop into a few adds.
+    n_bands = skyvaultaltint.shape[0]
+    Wfull = [None] * n_bands
+    Waniso = [None] * n_bands
+    for i in range(n_bands):
+        wf = torch.zeros((), device=device)
+        wa = torch.zeros((), device=device)
+        for k in range(int(annulino[i]) + 1, int(annulino[i + 1]) + 1):
+            wf = wf + annulus_weight(k, aziinterval[i], device)
+            wa = wa + annulus_weight(k, aziintervalaniso[i], device)
+        Wfull[i] = wf
+        Waniso[i] = wa
+
+    # Patch-batched march: fill shmat/vegshmat/vbshvegshmat one altitude band at a
+    # time (all its azimuths at once) instead of one patch at a time. Bush-free only;
+    # bush tiles or SOLWEIG_BATCH_MARCH=0 fall back to the per-patch path below.
+    use_batch = (os.environ.get("SOLWEIG_BATCH_MARCH", "1") == "1") and (not bool(bush.max() > 0.))
+    if use_batch:
+        try:
+            _bsz = int(os.environ.get("SOLWEIG_BATCH_SIZE", "16"))
+        except ValueError:
+            _bsz = 16
+        # VRAM-aware clamp: a march step holds ~14 live f32 planes per lane
+        # (carried state, gather outputs, core temporaries); cap the lane count
+        # to half the free headroom so big tiles can't OOM. Partitioning cannot
+        # change any lane's output (lanes are independent), only throughput.
+        # Set SOLWEIG_BATCH_CLAMP=0 to use SOLWEIG_BATCH_SIZE verbatim.
+        if torch.cuda.is_available() and os.environ.get("SOLWEIG_BATCH_CLAMP", "1") == "1":
+            try:
+                free_b, _total_b = torch.cuda.mem_get_info()
+                pool_slack = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+                per_lane = rows * cols * 4 * 14
+                cap = max(1, int((free_b + pool_slack) * 0.5 // per_lane))
+                if cap < _bsz:
+                    print(f"[SOLWEIG] SOLWEIG_BATCH_SIZE {_bsz} -> {cap} (VRAM headroom)")
+                    _bsz = cap
+            except Exception:  # pragma: no cover - never block the march on accounting
+                pass
+        # Optionally pad tail batches to a fixed lane count so the compiled step
+        # sees one (P,H,W) shape per tile instead of ~9 (see shadow_batch
+        # docstring). Off by default: padded lanes cost real bandwidth, and the
+        # zenith band (altitude 90, P=1) is pathological — float32 tan(90 deg) is
+        # NEGATIVE, so its dz never exceeds the ceiling and it marches to the
+        # grid bound (~max(H,W) steps) in both this and the original code;
+        # padding that 1-lane batch 16x multiplies the waste. Per-shape
+        # recompiles are cheap (dynamo cache limit is raised alongside the
+        # compiled step) and happen once per process.
+        _pad_to = _bsz if os.environ.get("SOLWEIG_BATCH_PAD", "0") == "1" else None
+        _gstart = 0
+        for i in range(skyvaultaltint.shape[0]):
+            Pi = int(aziinterval[i])
+            altitude_i = skyvaultaltint[i]
+            band_az = iazimuth[0, _gstart:_gstart + Pi]
+            c = 0
+            while c < Pi:
+                cP = min(_bsz, Pi - c)
+                shb, vegshb, vbshb = shadow_batch(
+                    march_ceiling, a, vegdem, vegdem2, band_az[c:c + cP], altitude_i, scale,
+                    pad_to=_pad_to
+                )
+                s = _gstart + c
+                shmat[:, :, s:s + cP] = shb.permute(1, 2, 0)
+                vegshmat[:, :, s:s + cP] = vegshb.permute(1, 2, 0)
+                vbshvegshmat[:, :, s:s + cP] = vbshb.permute(1, 2, 0)
+                del shb, vegshb, vbshb
+                c += cP
+            _gstart += Pi
+
+    # Read the per-patch azimuths to host once: the direction tests below
+    # (`0 <= azimuth < 180` etc.) on 0-dim GPU tensors would otherwise cost
+    # ~1200 GPU->CPU syncs per tile. float32 -> Python float is exact, so every
+    # branch decision (and hence accumulation order and operands) is unchanged.
+    # Set SOLWEIG_FAST_ACCUM=0 to restore the tensor comparisons.
+    fast_accum = os.environ.get("SOLWEIG_FAST_ACCUM", "1") == "1"
+    iaz_host = iazimuth[0].detach().cpu().tolist() if fast_accum else None
+
     index = 0
     for i in range(skyvaultaltint.shape[0]):
         for j in range(aziinterval[i].int()):
             altitude = skyvaultaltint[i]
-            azimuth = iazimuth[0, index]
-            sh, vegsh, vbshvegsh = shadow(amaxvalue, a, vegdem, vegdem2, bush, azimuth, altitude, scale)
+            azimuth_t = iazimuth[0, index]
+            azimuth = iaz_host[index] if fast_accum else azimuth_t
+            if use_batch:
+                sh = shmat[:, :, index]
+                vegsh = vegshmat[:, :, index]
+                vbshvegsh = vbshvegshmat[:, :, index]
+            else:
+                sh, vegsh, vbshvegsh = shadow(march_ceiling, a, vegdem, vegdem2, bush, azimuth_t, altitude, scale)
+                vegshmat[:, :, index] = vegsh
+                vbshvegshmat[:, :, index] = vbshvegsh
+                shmat[:, :, index] = sh
 
-            vegshmat[:, :, index] = vegsh
-            vbshvegshmat[:, :, index] = vbshvegsh
-            shmat[:, :, index] = sh
+            wf = Wfull[i]
+            wa = Waniso[i]
+            svf = svf + wf * sh
+            weight = wa * sh
+            if 0 <= azimuth < 180:
+                svfE = svfE + weight
+            if 90 <= azimuth < 270:
+                svfS = svfS + weight
+            if 180 <= azimuth < 360:
+                svfW = svfW + weight
+            if 270 <= azimuth < 90:
+                svfN = svfN + weight
 
-            for k in range(annulino[i]+1, annulino[i+1]+1):
-                weight = annulus_weight(k, aziinterval[i], device) * sh
-                svf = svf + weight
-                weight = annulus_weight(k, aziintervalaniso[i], device) * sh
-                if 0 <= azimuth < 180:
-                    svfE = svfE + weight
-                if 90 <= azimuth < 270:
-                    svfS = svfS + weight
-                if 180 <= azimuth < 360:
-                    svfW = svfW + weight
-                if 270 <= azimuth < 90:
-                    svfN = svfN + weight
-
-                weight = annulus_weight(k, aziinterval[i], device)
-                svfveg = svfveg + weight * vegsh
-                svfaveg = svfaveg + weight * vbshvegsh
-                weight = annulus_weight(k, aziintervalaniso[i], device)
-                if 0 <= azimuth < 180:
-                    svfEveg = svfEveg + weight * vegsh
-                    svfEaveg = svfEaveg + weight * vbshvegsh
-                if 90 <= azimuth < 270:
-                    svfSveg = svfSveg + weight * vegsh
-                    svfSaveg = svfSaveg + weight * vbshvegsh
-                if 180 <= azimuth < 360:
-                    svfWveg = svfWveg + weight * vegsh
-                    svfWaveg = svfWaveg + weight * vbshvegsh
-                if 270 <= azimuth < 90:
-                    svfNveg = svfNveg + weight * vegsh
-                    svfNaveg = svfNaveg + weight * vbshvegsh
+            svfveg = svfveg + wf * vegsh
+            svfaveg = svfaveg + wf * vbshvegsh
+            if 0 <= azimuth < 180:
+                svfEveg = svfEveg + wa * vegsh
+                svfEaveg = svfEaveg + wa * vbshvegsh
+            if 90 <= azimuth < 270:
+                svfSveg = svfSveg + wa * vegsh
+                svfSaveg = svfSaveg + wa * vbshvegsh
+            if 180 <= azimuth < 360:
+                svfWveg = svfWveg + wa * vegsh
+                svfWaveg = svfWaveg + wa * vbshvegsh
+            if 270 <= azimuth < 90:
+                svfNveg = svfNveg + wa * vegsh
+                svfNaveg = svfNaveg + wa * vbshvegsh
 
             index += 1
     svfS = svfS + 3.0459e-004
@@ -618,8 +988,6 @@ def svf_calculator(patch_option, amaxvalue=None, a=None, vegdem=None, vegdem2=No
             svftotal=SVFtotal, number=number,
         )
 
-    del sh, vegsh,vbshvegsh, last, weight
-    torch.cuda.empty_cache()
-    
+    del sh, vegsh, vbshvegsh, last, weight
     return svf, svfaveg, svfE, svfEaveg, svfEveg, svfN, svfNaveg, svfNveg, svfS, svfSaveg, svfSveg, svfveg, svfW, svfWaveg, svfWveg, vegshmat, vbshvegshmat, shmat, SVFtotal
 

@@ -37,7 +37,13 @@ thermal_comfort(
     save_kdown=False,
     save_lup=False,
     save_ldown=False,
-    save_shadow=False
+    save_shadow=False,
+    clip_buildings=True,
+    albedo_filename=None,
+    baseline_albedo_filename=None,
+    albedo_walls=0.2,
+    albedo_ground=0.15,
+    tree_transmissivity_pct=None
 )
 ```
 
@@ -48,7 +54,7 @@ thermal_comfort(
 -   `building_dsm_filename` (str): Path or filename of the Building DSM raster (relative to `base_path`, or a complete path). Defaults to `'Building_DSM.tif'`.
 -   `dem_filename` (str): Path or filename of the DEM raster. Defaults to `'DEM.tif'`.
 -   `trees_filename` (str): Path or filename of the Tree DSM raster. Defaults to `'Trees.tif'`.
--   `landcover_filename` (str, optional): Path or filename of the land cover raster. Defaults to `None`.
+-   `landcover_filename` (str, optional): Path or filename of the land cover raster, in SOLWEIG codes (1 paved, 2 buildings, 5 grass, 6 bare soil, 7 water) and on the Building DSM grid. Convert OpenUrban land cover first with `python -m solweig_gpu.landcover`. Defaults to `None`. See [Input Data – Land Cover](input_data.md#land-cover-optional).
 -   `tile_size` (int): The size of the tiles in pixels. Defaults to `3600`.
 -   `overlap` (int): The overlap between tiles in pixels. Defaults to `20`.
 -   `use_own_met` (bool): Whether to use a custom meteorological file. Defaults to `True`.
@@ -64,6 +70,12 @@ thermal_comfort(
 -   `save_lup` (bool, optional): Whether to save the upwelling longwave radiation output. Defaults to `False`.
 -   `save_ldown` (bool, optional): Whether to save the downwelling longwave radiation output. Defaults to `False`.
 -   `save_shadow` (bool, optional): Whether to save the shadow map output. Defaults to `False`.
+-   `clip_buildings` (bool, optional): Whether to set building footprints (Building DSM − DEM ≥ 2 m) to NaN in the UTCI and Shadow outputs. `False` keeps the rooftop values. Defaults to `True`. See [Outputs – Building clipping](outputs.md#building-clipping).
+-   `albedo_filename` (str, optional): Path or filename of a ground albedo raster (fractions 0–1, any grid). It replaces the land-cover or default ground albedo. Defaults to `None`. See [Input Data – Albedo](input_data.md#albedo-optional).
+-   `baseline_albedo_filename` (str, optional): Path or filename of the baseline albedo raster for cool-roof scenarios; requires `albedo_filename`. The forcing air temperature is lowered by 6 × (mean albedo increase) °C at 12:00 local time, less until 18:00, and not at all outside 12:00–18:00. Defaults to `None`.
+-   `albedo_walls` (float, optional): Wall albedo (0–1). Defaults to `0.2`.
+-   `albedo_ground` (float, optional): Ground albedo (0–1) used where there is neither land cover nor an albedo raster. Defaults to `0.15`.
+-   `tree_transmissivity_pct` (float, optional): Percent (0–100) of the light, direct sun and diffuse sky light, that gets through tree canopies on every date, e.g. `3` for trees in leaf all year as in tropical cities. `None` (default) uses a temperate deciduous season: 3% on day of year 98–299, and outside it 50% of the direct sun (3% of the diffuse light). See [Outputs – Tree Transmissivity Tag](outputs.md#tree-transmissivity-tag).
 
 ---
 
@@ -86,12 +98,14 @@ preprocess_dir = preprocess(
     use_own_met=True,
     own_met_file="/path/to/met.txt",
     preprocess_dir=None,  # optional; default is base_path/processed_inputs
+    albedo_filename=None,  # optional ground albedo raster (0-1)
+    baseline_albedo_filename=None,  # optional; enables the cool-roof air-temperature cut
 )
 ```
 
 **Returns:** Path to the preprocessing directory (string).
 
-**Parameters:** Same as the first part of `thermal_comfort` (base_path, selected_date_str, raster filenames, tile_size, overlap, met options). Optional `preprocess_dir` overrides the default output directory.
+**Parameters:** Same as the first part of `thermal_comfort` (base_path, selected_date_str, raster filenames including `albedo_filename` and `baseline_albedo_filename`, tile_size, overlap, met options). Optional `preprocess_dir` overrides the default output directory. The albedo raster is resampled onto the Building DSM grid if needed and tiled into `{preprocess_dir}/Albedo/`; with a baseline, the air-temperature cut is recorded in `{preprocess_dir}/Albedo/air_temp_cut.json`. Without `albedo_filename`, an `Albedo/` folder left by an earlier run is removed.
 
 ---
 
@@ -132,6 +146,12 @@ run_utci_tiles(
     save_lup=False,
     save_ldown=False,
     save_shadow=False,
+    clip_buildings=True,
+    overwrite=False,
+    albedo_walls=0.2,
+    albedo_ground=0.15,
+    air_temp_cut=None,
+    tree_transmissivity_pct=None,
 )
 ```
 
@@ -141,7 +161,9 @@ run_utci_tiles(
 -   `preprocess_dir` (str): Path returned by `preprocess()`.
 -   `selected_date_str` (str): Simulation date `YYYY-MM-DD`.
 -   `tile_keys` (list, optional): If `None`, process all tiles. If a list (e.g. `["0_0", "1000_0"]`), process only those tile keys.
--   `save_tmrt`, `save_svf`, `save_kup`, `save_kdown`, `save_lup`, `save_ldown`, `save_shadow`: Same as in `thermal_comfort()`.
+-   `save_tmrt`, `save_svf`, `save_kup`, `save_kdown`, `save_lup`, `save_ldown`, `save_shadow`, `clip_buildings`, `albedo_walls`, `albedo_ground`, `tree_transmissivity_pct`: Same as in `thermal_comfort()`. The albedo raster, if any, is picked up from `{preprocess_dir}/Albedo/`.
+-   `overwrite` (bool, optional): If `False` (default), skip tiles whose requested outputs already exist, so an interrupted run resumes. A tile whose UTCI or Shadow was written with a different `clip_buildings` or `tree_transmissivity_pct` setting (or before the latter was recorded), or whose UTCI was written with different albedo settings, is recomputed. `True` recomputes every tile.
+-   `air_temp_cut` (float, optional): Cool-roof air-temperature cut at 12:00 local time, in °C. `None` (default) uses the cut `preprocess()` derived from `baseline_albedo_filename`, or no cut if there was none.
 
 **Returns:** None. Writes GeoTIFFs to `{base_path}/output_folder/{tile_key}/`.
 

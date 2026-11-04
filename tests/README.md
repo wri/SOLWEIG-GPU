@@ -11,6 +11,7 @@ The test suite is organized as follows:
 -   `test_calculate_utci.py`: Tests for UTCI calculation.
 -   `test_walls_aspect.py`: Tests for wall height and aspect calculations.
 -   `test_integration.py`: Integration tests that verify the entire workflow.
+-   `test_shadow_bush.py`: Regression tests for the per-patch shadow march (`shadow()` bush branch) and its exact agreement with the batched march.
 
 ## Running the Tests
 

@@ -1,7 +1,7 @@
 torch
-numpy
+numpy==2.3.5
 scipy
-pandas
+pandas==3.0.3  # 3.0.4 cp314 wheel segfaults on Timedelta arithmetic (Python 3.14)
 netCDF4
 pytz
 shapely
@@ -9,3 +9,5 @@ timezonefinder
 xarray
 tqdm
 matplotlib
+cdsapi
+numba

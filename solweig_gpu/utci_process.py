@@ -34,6 +34,8 @@ from .shadow import svf_calculator, create_patches
 from .solweig import Solweig_2022a_calc, clearnessindex_2013b
 from .calculate_utci import utci_calculator
 from .calculate_wbgt import isobaric_wet_bulb_temperature_from_rh, black_globe_temperature
+from .albedo import (ALBEDO_TAG, GROUND_ALBEDO_DEFAULT, WALL_ALBEDO_DEFAULT, air_temp_cut_factor,
+                     albedo_tag, check_albedo_bounds, check_fraction)
 import os
 import re
 import zipfile
@@ -46,9 +48,9 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 script_dir = os.path.dirname(__file__)
 landcover_classes_path = os.path.join(script_dir, 'landcoverclasses_2016a.txt')
 
-# Wall and ground emissivity and albedo
-albedo_b = 0.2
-albedo_g = 0.15
+# Wall and ground emissivity and albedo (default albedos; compute_utci can override them)
+albedo_b = WALL_ALBEDO_DEFAULT
+albedo_g = GROUND_ALBEDO_DEFAULT
 ewall = 0.9
 eground = 0.95
 absK = 0.7
@@ -66,7 +68,99 @@ onlyglobal = 1
 
 firstdayleaf = 97
 lastdayleaf = 300
-conifer_bool = False
+
+# GeoTIFF metadata item recording whether building footprints were set to NaN
+# (see compute_utci's clip_buildings). Written on the UTCI and Shadow outputs.
+CLIP_TAG = "CLIP_BUILDINGS"
+# Untagged files predate the option: UTCI was always clipped, Shadow never was.
+_LEGACY_CLIP = {"UTCI": True, "Shadow": False}
+
+def clip_state(path, var):
+    """
+    Report whether an existing UTCI/Shadow output has building pixels set to NaN.
+
+    Args:
+        path (str): Path to an output GeoTIFF written by compute_utci
+        var (str): Output variable, "UTCI" or "Shadow"
+
+    Returns:
+        bool or None: True/False from the CLIP_BUILDINGS metadata item (or the
+            legacy behaviour when the file has no tag), None if the file cannot
+            be read (callers should recompute it).
+    """
+    try:
+        ds = gdal.Open(path)
+    except RuntimeError:
+        return None
+    if ds is None:
+        return None
+    value = ds.GetMetadataItem(CLIP_TAG)
+    ds = None
+    if value is None:
+        return _LEGACY_CLIP.get(var, False)
+    return value.strip().upper() == "YES"
+
+# GeoTIFF metadata item recording the tree_transmissivity_pct that the UTCI and
+# Shadow outputs were computed with (see tree_tag).
+TREES_TAG = "TREE_TRANSMISSIVITY_PCT"
+
+def check_tree_transmissivity(pct):
+    """
+    Validate a tree_transmissivity_pct setting.
+
+    Args:
+        pct (float): Percent of the light that gets through tree canopies, or None
+
+    Returns:
+        float or None: pct as a float, or None for the seasonal default
+
+    Raises:
+        ValueError: Unless pct is None or a number from 0 to 100
+    """
+    if pct is None:
+        return None
+    if isinstance(pct, bool) or not 0.0 <= float(pct) <= 100.0:
+        raise ValueError(f"tree_transmissivity_pct must be a percentage from 0 to 100 (or None), got {pct!r}")
+    return float(pct)
+
+def tree_tag(tree_transmissivity_pct):
+    """
+    Value of the TREE_TRANSMISSIVITY_PCT metadata item for outputs computed with this setting.
+
+    Args:
+        tree_transmissivity_pct (float): Percent of the light that gets through tree
+            canopies, or None for the seasonal default
+
+    Returns:
+        str: "seasonal" for None, otherwise the percentage (e.g. "3", "12.5")
+    """
+    if tree_transmissivity_pct is None:
+        return "seasonal"
+    # "+ 0.0" turns -0.0 into 0.0 so both give the same tag.
+    return f"{float(tree_transmissivity_pct) + 0.0:.6g}"
+
+def tree_state(path):
+    """
+    Report the tree_transmissivity_pct an existing UTCI/Shadow output was computed with.
+
+    Args:
+        path (str): Path to an output GeoTIFF written by compute_utci
+
+    Returns:
+        str or None: The TREE_TRANSMISSIVITY_PCT metadata item (see tree_tag), or
+            None if the file has no such item or cannot be read (callers should
+            recompute it). Untagged files predate the setting; their trees may have
+            been in leaf all year or only seasonally.
+    """
+    try:
+        ds = gdal.Open(path)
+    except RuntimeError:
+        return None
+    if ds is None:
+        return None
+    value = ds.GetMetadataItem(TREES_TAG)
+    ds = None
+    return value
 
 def load_raster_to_tensor(dem_path):
     """
@@ -144,6 +238,60 @@ def map_files_by_key(directory, extension, is_metfile=False):
         if key:
             mapping[key] = os.path.join(directory, f)
     return mapping
+
+def map_metfiles_by_key(directory, selected_date_str):
+    """
+    Map tile key -> metfile path, preferring the metfile for ``selected_date_str``.
+
+    Handles both metfile naming schemes produced by preprocessing:
+      - ERA5/WRF:  ``metfile_<i>_<j>_<YYYY-MM-DD>.txt``  (date-suffixed)
+      - own met:   ``metfile_<i>_<j>.txt``               (no date)
+
+    For each tile key, the metfile matching ``selected_date_str`` is used when
+    present; otherwise a date-less metfile for that key is used. Metfiles for
+    other dates are ignored, so accumulating several dates in one metfiles
+    folder no longer causes the wrong date's metfile to be selected.
+
+    Args:
+        directory (str): Folder containing metfile .txt files.
+        selected_date_str (str): Simulation date 'YYYY-MM-DD'.
+
+    Returns:
+        dict: Mapping of tile key (e.g. "0_0") to metfile path.
+    """
+    pattern = re.compile(r'^metfile_(\d+)_(\d+)(?:_(\d{4}-\d{2}-\d{2}))?\.txt$')
+
+    dated = {}          # key -> path for selected_date_str
+    undated = {}        # key -> path for date-less (own-met) metfiles
+    other_dates = {}    # key -> set of other dates present (for the warning)
+
+    for f in get_matching_files(directory, ".txt"):
+        m = pattern.match(f)
+        if not m:
+            continue
+        key = f"{m.group(1)}_{m.group(2)}"
+        date = m.group(3)
+        path = os.path.join(directory, f)
+        if date is None:
+            undated[key] = path
+        elif date == selected_date_str:
+            dated[key] = path
+        else:
+            other_dates.setdefault(key, set()).add(date)
+
+    met_map = {}
+    for key in set(dated) | set(undated):
+        met_map[key] = dated.get(key) or undated.get(key)
+
+    skipped = sorted(set(other_dates) - set(met_map))
+    if skipped:
+        print(
+            f"[WARNING] {len(skipped)} tile(s) have metfiles only for dates other "
+            f"than {selected_date_str}; they will be skipped. "
+            f"Example keys: {skipped[:5]}"
+        )
+
+    return met_map
 
 def extract_number_from_filename(filename):
     """
@@ -272,7 +420,9 @@ def load_cached_svf_outputs(building_dsm_path: str, number: str):
 
 def compute_utci(building_dsm_path, tree_path, dem_path, walls_path, aspect_path, landcover_path, windcoeff_path, met_file,
                 output_path,number,selected_date_str,save_tmrt=False,save_svf=False, save_kup=False,save_kdown=False,save_lup=False,
-                save_ldown=False,save_shadow=False,save_wbgt=False,save_ta=False,save_wind=False):
+                save_ldown=False,save_shadow=False,save_wbgt=False,save_ta=False,save_wind=False,clip_buildings=True,
+                albedo_path=None,albedo_walls=albedo_b,albedo_ground=albedo_g,air_temp_cut=0.0,
+                tree_transmissivity_pct=None):
     """
     Compute UTCI and related thermal comfort outputs for a single tile.
     
@@ -300,16 +450,40 @@ def compute_utci(building_dsm_path, tree_path, dem_path, walls_path, aspect_path
         save_shadow (bool): Save shadow maps
         save_ta (bool): Save diagnostic air temperature field
         save_wind (bool): Save diagnostic wind speed field
+        clip_buildings (bool): Set building footprints (Building DSM - DEM >= 2 m)
+            to NaN in the UTCI and Shadow outputs. False keeps the rooftop values.
+        albedo_path (str): Path to a ground albedo raster tile (0-1), or None. It
+            replaces the land-cover or default ground albedo; its NaN/nodata
+            pixels keep that albedo.
+        albedo_walls (float): Wall albedo (0-1)
+        albedo_ground (float): Ground albedo (0-1) used without land cover
+        air_temp_cut (float): Cool-roof air-temperature cut at 12:00 local time
+            (°C), scaled by air_temp_cut_factor and subtracted from the forcing
+            air temperature
+        tree_transmissivity_pct (float): Percent (0-100) of the light, direct sun
+            and diffuse sky light, that gets through tree canopies on every date.
+            None (default) uses a temperate deciduous season: 3% on days 98-299,
+            and outside it 50% of the direct sun (3% of the diffuse light)
 
     Returns:
         None: Outputs are saved as GeoTIFF files in output_path
-    
+
     Notes:
         - Automatically uses GPU if available
         - Outputs are multi-band rasters (one band per hour)
         - UTCI is always computed and saved
         - Other outputs are optional based on save_* flags
+        - UTCI and Shadow record the clip_buildings setting in their
+          CLIP_BUILDINGS metadata item ("YES"/"NO")
+        - UTCI records the albedo settings in its ALBEDO metadata item
+        - UTCI and Shadow record tree_transmissivity_pct in their
+          TREE_TRANSMISSIVITY_PCT metadata item ("seasonal" for None)
     """
+    albedo_walls = check_fraction("albedo_walls", albedo_walls)
+    albedo_ground = check_fraction("albedo_ground", albedo_ground)
+    air_temp_cut = float(air_temp_cut)
+    tree_transmissivity_pct = check_tree_transmissivity(tree_transmissivity_pct)
+
     a, dataset = load_raster_to_tensor(building_dsm_path)
     temp1, dataset2 = load_raster_to_tensor(tree_path)
     temp2, dataset3 = load_raster_to_tensor(dem_path)
@@ -327,7 +501,25 @@ def compute_utci(building_dsm_path, tree_path, dem_path, walls_path, aspect_path
                 f"Wind coefficient raster shape {tuple(windcoeff.shape)} does not match "
                 f"Building DSM shape {tuple(a.shape)}"
             )
- 
+
+    albedo_raster = None
+    dataset8 = None
+    if albedo_path is not None:
+        albedo_raster, dataset8 = load_raster_to_tensor(albedo_path)
+
+        if albedo_raster.shape != a.shape:
+            raise ValueError(
+                f"Albedo raster shape {tuple(albedo_raster.shape)} does not match "
+                f"Building DSM shape {tuple(a.shape)}"
+            )
+        albedo_nodata = dataset8.GetRasterBand(1).GetNoDataValue()
+        albedo_missing = torch.isnan(albedo_raster)
+        if albedo_nodata is not None and not math.isnan(albedo_nodata):
+            albedo_missing |= albedo_raster == albedo_nodata
+        albedo_valid = albedo_raster[~albedo_missing]
+        if albedo_valid.numel():
+            check_albedo_bounds(albedo_valid.min().item(), albedo_valid.max().item(), albedo_path)
+
     # Added
     landcover = 0
 
@@ -451,18 +643,26 @@ def compute_utci(building_dsm_path, tree_path, dem_path, walls_path, aspect_path
     else:
         TgK = Knight + 0.37
         Tstart = Knight - 3.41
-        alb_grid = Knight + albedo_g
+        alb_grid = Knight + albedo_ground
         emis_grid = Knight + eground
         TgK_wall = 0.37
         Tstart_wall = -3.41
         TmaxLST = 15.
         TmaxLST_wall = 15.
     # Added
-    
-    transVeg = 3. / 100.
+
+    if albedo_raster is not None:
+        # Like CTCM, the albedo raster overrides the land-cover/default ground albedo
+        # (roofs included); land cover still sets surface temperatures and emissivity.
+        alb_grid = torch.where(albedo_missing, alb_grid, albedo_raster.clamp(0.0, 1.0))
+
+    # Share of the light that gets through tree canopies in leaf: 3% unless a percentage is given
+    transVeg = (3. if tree_transmissivity_pct is None else tree_transmissivity_pct) / 100.
     # landcover = 1 # Modified
     if landcover == 1:
-        lcgrid = lcgrid_torch
+        # The recoded grid (trees -> grass, invalid -> bare soil). On the GPU,
+        # lcgrid_torch still holds the raw codes, and the solver treats code 3 as water.
+        lcgrid = torch.from_numpy(lcgrid_np).to(device)
     else:
         lcgrid = False
     anisotropic_sky = 1
@@ -477,7 +677,13 @@ def compute_utci(building_dsm_path, tree_path, dem_path, walls_path, aspect_path
     radI = torch.tensor(met_file[:, 22], device=device)
     P = torch.tensor(met_file[:, 12], device=device)
     Ws = torch.tensor(met_file[:, 9], device=device)
-                    
+
+    if air_temp_cut:
+        # Cool-roof cut: lower the forcing air temperature itself, so the radiation
+        # model, WBGT and UTCI all use it. Missing forcing (-999) is left as is.
+        cut = air_temp_cut * air_temp_cut_factor(met_file[:, 2] + met_file[:, 3] / 60.0)
+        Ta = torch.where(Ta > -998.0, Ta - torch.tensor(cut, device=device, dtype=Ta.dtype), Ta)
+
     if met_file.shape[1] > 24:
         uhii = torch.tensor(met_file[:, 24], device=device)
     else:
@@ -490,8 +696,9 @@ def compute_utci(building_dsm_path, tree_path, dem_path, walls_path, aspect_path
     
         wbt_np = isobaric_wet_bulb_temperature_from_rh(p=P_np * 1000.0, T=Ta_np + 273.15, rh=RH_np, phase='liquid', method='Romps',limit=True)
         wbt = torch.tensor(wbt_np, device=device, dtype=Ta.dtype)
-    # Prepare leafon based on vegetation type
-    if conifer_bool:
+    # Trees are in leaf every day when a percentage is given, otherwise only in the
+    # temperate season (leafless trees let 50% of the direct sun through)
+    if tree_transmissivity_pct is not None:
         leafon = torch.ones((1, DOY.shape[0]), device=device)
     else:
         leafon = torch.zeros((1, DOY.shape[0]), device=device)
@@ -542,9 +749,8 @@ def compute_utci(building_dsm_path, tree_path, dem_path, walls_path, aspect_path
     
     svfbuveg = svf - (1.0 - svfveg) * (1.0 - transVeg)
     asvf = torch.acos(torch.sqrt(svf))
-    diffsh = torch.zeros((rows, cols, shmat.shape[2]), device=device)
-    for i in range(shmat.shape[2]):
-        diffsh[:, :, i] = shmat[:, :, i] - (1 - vegshmat[:, :, i]) * (1 - transVeg)
+    # Elementwise over all patches at once (bit-identical to the per-patch loop, no Python overhead).
+    diffsh = shmat - (1 - vegshmat) * (1 - transVeg)
     tmp = svf + svfveg - 1.0
     tmp[tmp < 0.0] = 0.0
     svfalfa = torch.asin(torch.exp(torch.log(1.0 - tmp) / 2.0))
@@ -581,7 +787,7 @@ def compute_utci(building_dsm_path, tree_path, dem_path, walls_path, aspect_path
         Tmrt, Kdown, Kup, Ldown, Lup, Tg, ea, esky, I0, CI, shadow, firstdaytime, timestepdec, timeadd, \
         Tgmap1, Tgmap1E, Tgmap1S, Tgmap1W, Tgmap1N, Keast, Ksouth, Kwest, Knorth, Least, Lsouth, Lwest, Lnorth, \
         KsideI, TgOut1, TgOut, radIout, radDout, Lside, Lsky_patch_characteristics, CI_Tg, CI_TgG, KsideD, dRad, Kside = Solweig_2022a_calc(
-            i, a, scale, rows, cols, svf, svfN, svfW, svfE, svfS, svfveg, svfNveg, svfEveg, svfSveg, svfWveg, svfaveg, svfEaveg, svfSaveg, svfWaveg, svfNaveg, vegdsm, vegdsm2, albedo_b, absK, absL, ewall, Fside, Fup, Fcyl,
+            i, a, scale, rows, cols, svf, svfN, svfW, svfE, svfS, svfveg, svfNveg, svfEveg, svfSveg, svfWveg, svfaveg, svfEaveg, svfSaveg, svfWaveg, svfNaveg, vegdsm, vegdsm2, albedo_walls, absK, absL, ewall, Fside, Fup, Fcyl,
             altitude[0][i], azimuth[0][i], zen[0][i], jday[0][i], usevegdem, onlyglobal, buildings, location, psi[0][i], landcover, lcgrid, dectime[i], altmax[0][i], dirwalls, walls, cyl, elvis, Ta[i], RH[i], radG[i], radD[i], radI[i], P[i],
             amaxvalue, bush, Twater, TgK, Tstart, alb_grid, emis_grid, TgK_wall, Tstart_wall, TmaxLST, TmaxLST_wall, first, second, svfalfa, svfbuveg, firstdaytime, timeadd, timestepdec, Tgmap1, Tgmap1E, Tgmap1S, Tgmap1W, Tgmap1N,
             CI, TgOut1, diffsh, shmat, vegshmat, vbshvegshmat, anisotropic_sky, asvf, patch_option)
@@ -605,8 +811,14 @@ def compute_utci(building_dsm_path, tree_path, dem_path, walls_path, aspect_path
             wbgt_mat = torch.where(cond, wbgt_sun, wbgt_shade)
         
         UTCI_mat = utci_calculator(Ta_mat, RH_mat, Tmrt_mat, va10m_mat)
-        UTCI = torch.full(UTCI_mat.shape, float('nan'), device=device)
-        UTCI[valid_mask] = UTCI_mat[valid_mask]
+        if clip_buildings:
+            # NaN out building footprints in the written UTCI/Shadow only; `shadow`
+            # itself stays unmasked because WBGT above uses it.
+            UTCI = torch.where(valid_mask, UTCI_mat, torch.nan)
+            shadow_out = torch.where(valid_mask, shadow, torch.nan)
+        else:
+            UTCI = UTCI_mat
+            shadow_out = shadow
         # Append results (converted to CPU numpy arrays) to the lists
         UTCI_all.append(UTCI.cpu().numpy())
         TMRT_all.append(Tmrt.cpu().numpy())
@@ -614,7 +826,7 @@ def compute_utci(building_dsm_path, tree_path, dem_path, walls_path, aspect_path
         Kdown_all.append(Kdown.cpu().numpy())
         Lup_all.append(Lup.cpu().numpy())
         Ldown_all.append(Ldown.cpu().numpy())
-        Shadow_all.append(shadow.cpu().numpy())
+        Shadow_all.append(shadow_out.cpu().numpy())
         if save_wbgt:
             wbgt_all.append(wbgt_mat.cpu().numpy())
         if save_ta:
@@ -652,6 +864,9 @@ def compute_utci(building_dsm_path, tree_path, dem_path, walls_path, aspect_path
         minute = int(minu[band].cpu().item())
         timestamp = base_date.replace(hour=hour, minute=minute).isoformat()
         out_band.SetMetadata({'Time': timestamp})
+    out_dataset.SetMetadataItem(CLIP_TAG, "YES" if clip_buildings else "NO")
+    out_dataset.SetMetadataItem(ALBEDO_TAG, albedo_tag(albedo_path, albedo_ground, albedo_walls, air_temp_cut))
+    out_dataset.SetMetadataItem(TREES_TAG, tree_tag(tree_transmissivity_pct))
     out_dataset = None
     # Optionally, you can similarly write TMRT to a single multi-band file:
     if save_tmrt:
@@ -769,6 +984,8 @@ def compute_utci(building_dsm_path, tree_path, dem_path, walls_path, aspect_path
             minute = int(minu[band].cpu().item())
             timestamp = base_date.replace(hour=hour, minute=minute).isoformat()
             out_band.SetMetadata({'Time': timestamp})
+        out_dataset_op.SetMetadataItem(CLIP_TAG, "YES" if clip_buildings else "NO")
+        out_dataset_op.SetMetadataItem(TREES_TAG, tree_tag(tree_transmissivity_pct))
         out_dataset_op = None
     if save_wbgt:
         out_file_path_op = os.path.join(output_path, f'WBGT_{number}.tif')
@@ -826,6 +1043,7 @@ def compute_utci(building_dsm_path, tree_path, dem_path, walls_path, aspect_path
     dataset5 = None
     dataset6 = None
     dataset7 = None
+    dataset8 = None
     end_time = time.time()
     time_taken = end_time - start_time
     print(f"Time taken to execute tile {number}: {time_taken:.2f} seconds")

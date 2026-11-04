@@ -1,0 +1,53 @@
+# Pinned, mutually-compatible lock for SOLWEIG-GPU on Python 3.14.
+# Generated from the working environment. Key fix: pandas 3.0.4's cp314 wheel is
+# broken (segfaults on Timedelta arithmetic on Python 3.14); pinned to 3.0.3.
+# numpy kept at 2.3.5 (works; within numba<2.5 / scipy<2.8 / pandas>=2.3.3).
+# torch + its CUDA stack (nvidia-*, triton, cuda-*) are intentionally omitted —
+# if recreating from scratch, install torch from
+# https://download.pytorch.org/whl/cu130 first; it pulls those.
+certifi==2026.6.17
+cffi==2.0.0
+cftime==1.6.5
+contourpy==1.3.3
+coverage==7.14.3
+cycler==0.12.1
+filelock==3.29.4
+flatbuffers==25.12.19
+fonttools==4.63.0
+fsspec==2026.6.0
+GDAL==3.12.2
+h3==4.5.0
+iniconfig==2.3.0
+Jinja2==3.1.6
+kiwisolver==1.5.0
+llvmlite==0.47.0
+MarkupSafe==3.0.3
+matplotlib==3.11.0
+mpmath==1.3.0
+netCDF4==1.7.4
+networkx==3.6.1
+numba==0.65.1
+numpy==2.3.5
+packaging==26.2
+pandas==3.0.3
+pillow==12.2.0
+pluggy==1.6.0
+pycparser==3.0
+Pygments==2.20.0
+pyparsing==3.3.2
+PyQt5==5.15.11
+PyQt5-Qt5==5.15.19
+PyQt5_sip==12.18.0
+pytest==9.1.1
+pytest-cov==7.1.0
+python-dateutil==2.9.0.post0
+pytz==2026.2
+scipy==1.18.0
+setuptools==81.0.0
+shapely==2.1.2
+six==1.17.0
+sympy==1.14.0
+timezonefinder==8.2.4
+tqdm==4.68.3
+typing_extensions==4.15.0
+xarray==2026.4.0

@@ -14,7 +14,7 @@ import sys
 import os
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QLabel, QPushButton, QLineEdit, QFileDialog, QCheckBox,
-    QDateEdit, QSpinBox, QComboBox, QProgressBar, QTextEdit, QGroupBox, QFormLayout,
+    QDateEdit, QSpinBox, QDoubleSpinBox, QComboBox, QProgressBar, QTextEdit, QGroupBox, QFormLayout,
     QHBoxLayout, QFrame, QToolButton, QStyle, QMessageBox, QScrollArea, QDesktopWidget
 )
 from PyQt5.QtCore import QThread, pyqtSignal, Qt
@@ -203,6 +203,18 @@ class SOLWEIGApp(QWidget):
         self.trees = QLineEdit()
         self.landcover = QLineEdit()
         self.landcover.setPlaceholderText("Optional")
+        self.albedo = QLineEdit()
+        self.albedo.setPlaceholderText("Optional")
+        self.baseline_albedo = QLineEdit()
+        self.baseline_albedo.setPlaceholderText("Optional (cool-roof scenarios)")
+        self.albedo_walls = QDoubleSpinBox()
+        self.albedo_walls.setRange(0.0, 1.0)
+        self.albedo_walls.setSingleStep(0.01)
+        self.albedo_walls.setValue(0.2)
+        self.albedo_ground = QDoubleSpinBox()
+        self.albedo_ground.setRange(0.0, 1.0)
+        self.albedo_ground.setSingleStep(0.01)
+        self.albedo_ground.setValue(0.15)
         self.tile_size_input = QSpinBox()
         self.tile_size_input.setRange(100, 10000)
         self.tile_size_input.setValue(3600)
@@ -214,6 +226,10 @@ class SOLWEIGApp(QWidget):
         layout.addRow(self._label_with_help("DEM", "Digital Elevation Model of the terrain."), self._with_browse(self.dem))
         layout.addRow(self._label_with_help("Trees", "Raster layer representing vegetation height."), self._with_browse(self.trees))
         layout.addRow(self._label_with_help("Landcover", "Raster file for Landcover (Optional)"), self._with_browse(self.landcover))
+        layout.addRow(self._label_with_help("Albedo", "Ground albedo raster, fractions 0-1 (Optional). Replaces the land-cover or default ground albedo."), self._with_browse(self.albedo))
+        layout.addRow(self._label_with_help("Baseline Albedo", "Baseline albedo raster for cool-roof scenarios (Optional, needs Albedo). Lowers the air temperature by 6 x the mean albedo increase at 12:00, less until 18:00."), self._with_browse(self.baseline_albedo))
+        layout.addRow(self._label_with_help("Wall Albedo", "Albedo of building walls (0-1)."), self.albedo_walls)
+        layout.addRow(self._label_with_help("Ground Albedo", "Ground albedo (0-1) used where there is neither land cover nor an albedo raster."), self.albedo_ground)
         layout.addRow(self._label_with_help("Tile Size", "Controls resolution of GPU processing (100–10000)."), self.tile_size_input)
         layout.addRow(self._label_with_help("Overlap", "Overlap to the nearby tile, should be less than the tile size"), self.overlap)
         return layout
@@ -246,9 +262,11 @@ class SOLWEIGApp(QWidget):
         self.save_lup = QCheckBox("Long wave↑")
         self.save_ldown = QCheckBox("Long wave↓")
         self.save_shadow = QCheckBox("Shadow")
+        self.clip_buildings = QCheckBox("Mask buildings (NaN) in UTCI and Shadow")
+        self.clip_buildings.setChecked(True)
 
         for cb in [self.save_tmrt, self.save_svf, self.save_kup, self.save_kdown,
-                   self.save_lup, self.save_ldown, self.save_shadow]:
+                   self.save_lup, self.save_ldown, self.save_shadow, self.clip_buildings]:
             cb.setStyleSheet("color: #ffffff;")
             layout.addWidget(cb)
         return layout
@@ -346,7 +364,12 @@ class SOLWEIGApp(QWidget):
             save_kdown=self.save_kdown.isChecked(),
             save_lup=self.save_lup.isChecked(),
             save_ldown=self.save_ldown.isChecked(),
-            save_shadow=self.save_shadow.isChecked()
+            save_shadow=self.save_shadow.isChecked(),
+            clip_buildings=self.clip_buildings.isChecked(),
+            albedo_filename=self.albedo.text() if self.albedo.text().strip() else None,
+            baseline_albedo_filename=self.baseline_albedo.text() if self.baseline_albedo.text().strip() else None,
+            albedo_walls=self.albedo_walls.value(),
+            albedo_ground=self.albedo_ground.value(),
         )
         self.log_output.clear()
         self.progress.setValue(0)

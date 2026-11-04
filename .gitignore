@@ -8,3 +8,8 @@ NOTEBOOKS_SETUP.md
 
 # create_inputs test output (keep locally for analysis)
 austin_create_inputs/
+.*
+!.github
+!.gitignore
+!.coveragerc
+!.readthedocs.yml
