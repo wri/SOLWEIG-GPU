@@ -1,0 +1,81 @@
+# Settings for run.py: the SOLWEIG-GPU pipeline for one city and one date
+# (ERA5 download -> preprocess -> walls/aspect -> sky view factor -> UTCI -> mosaic).
+#
+#   python run.py                   # uses this file
+#   python run.py other_city.toml   # or a copy of it with other settings
+#
+# Every setting is required except those marked "Optional": leave an optional
+# setting out (or comment it out) to turn it off.
+
+[paths]
+# Folder with the input rasters. The tiles and caches go to <base_path>/processed_inputs/,
+# the outputs to <base_path>/output_folder/. A relative base_path is relative to
+# this file's folder.
+base_path = "data/mumbai/"
+# Input rasters, relative to base_path (or absolute paths).
+building_dsm = "Building_DSM.tif"   # its extent also sets the ERA5 download area
+dem = "DEM.tif"
+trees = "Trees.tif"
+# Optional: OpenUrban land cover, converted to SOLWEIG codes into `landcover` on
+# every run. Leave it out when `landcover` already holds SOLWEIG codes.
+openurban = "OpenUrban.tif"
+# Optional: land cover in SOLWEIG codes.
+landcover = "Landcover.tif"
+# Optional: ground albedo raster, fractions 0-1 (it is used as it is).
+albedo = "Albedo.tif"
+# ERA5 forcing. The download step fills this folder, and skips the download when
+# the folder already covers the time window.
+era5_folder = "era-5-single-levels"
+
+[time]
+# Simulation date (YYYY-MM-DD).
+date = "2025-05-29"
+# UTC window. It must span every hour in `hours`; here it's the whole day, so any
+# UTC hour can be selected. The ERA5 download fetches the UTC day `date`, so keep
+# the window inside that day.
+start = "2025-05-29 00:00:00"
+end = "2025-05-29 23:00:00"
+# Optional: only simulate these UTC hours of the day (non-contiguous is fine); each
+# becomes one output band. 4, 9, 12 UTC = 09:30, 14:30, 17:30 IST (UTC+5:30).
+# Leave it out to simulate every hour in the window.
+hours = [4, 9, 12]
+
+[era5]
+# "era5": ERA5 single-levels (0.25°), data over land and sea.
+# "era5-land": ERA5-Land (0.1°), but it has no data over the sea, which gives coastal
+# tiles -999 forcing and -999 UTCI. Use "era5" for coastal cities such as Mumbai.
+source = "era5"
+
+[tiling]
+tile_size = 2000   # pixels
+# Pixels. The walls/aspect and SVF caches in processed_inputs/ are only valid for
+# the input rasters, tile_size and overlap they were built with.
+overlap = 20
+# true: rebuild the walls/aspect and SVF caches, needed after changing the input
+# rasters, tile_size or overlap. false: reuse the tiles that already exist.
+overwrite_geometry = false
+
+[model]
+# Optional: percent (0-100) of the light, direct and diffuse, that gets through tree
+# canopies on every date. Indian urban trees are in leaf all year: 3. Leave it out
+# for a temperate season: trees leafless (50% of direct sun) outside 7 Apr - 26 Oct.
+tree_transmissivity_pct = 3
+
+[outputs]
+# UTCI is always saved. These add more outputs per tile.
+save_tmrt = false    # mean radiant temperature
+save_svf = false     # sky view factor
+save_kup = false     # upward shortwave
+save_kdown = false   # downward shortwave
+save_lup = false     # upward longwave
+save_ldown = false   # downward longwave
+save_shadow = true
+# true: building footprints are NaN in UTCI and Shadow. false: rooftop values are kept.
+clip_buildings = false
+# false: resume, skipping tiles already computed with these settings (tiles written
+# with another clip_buildings, albedo or tree setting are recomputed).
+# true: recompute every tile.
+overwrite = false
+# Mosaic in output_folder/mosaic/. true: one single-band GeoTIFF per hour
+# (e.g. UTCI_2025-05-29_0930.tif). false: one multi-band GeoTIFF per variable.
+split_bands = true
