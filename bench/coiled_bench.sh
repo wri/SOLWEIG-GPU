@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Run bench.py on one or more EC2 instance types with `coiled run`, and save each
+# run's results JSON to bench_runs/results/ locally.
+#
+#   bench/coiled_bench.sh g4dn.xlarge c7i.2xlarge -- --crop 1000
+#
+# Instance types go before `--`; everything after it is passed to bench.py.
+# Runs start in parallel, one VM each. Logs go to bench_runs/logs/.
+# Needs the software environment from bench/coiled-env.yml (see bench/README.md).
+# Set WORKSPACE or SOFTWARE to override the Coiled workspace / software environment.
+set -euo pipefail
+
+SOFTWARE="${SOFTWARE:-solweig-bench}"
+WORKSPACE="${WORKSPACE:-wri-cities-data}"
+cd "$(dirname "$0")/.."
+
+vm_types=()
+while [[ $# -gt 0 && "$1" != "--" ]]; do vm_types+=("$1"); shift; done
+[[ "${1:-}" == "--" ]] && shift
+bench_args=("$@")
+if [[ ${#vm_types[@]} -eq 0 ]]; then
+    echo "usage: $0 VM_TYPE [VM_TYPE ...] [-- bench.py args]" >&2
+    exit 2
+fi
+
+mkdir -p bench_runs/logs bench_runs/results
+stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+
+run_one() {
+    local vm="$1" log="bench_runs/logs/${stamp}_$1.log"
+    local gpu_flag=()
+    [[ "$vm" == g* || "$vm" == p* ]] && gpu_flag=(--gpu)
+    echo "[coiled_bench] $vm: starting (log: $log)"
+    if uvx coiled run \
+        --workspace "$WORKSPACE" \
+        --software "$SOFTWARE" \
+        --vm-type "$vm" "${gpu_flag[@]}" \
+        --name "solweig-bench-${vm//./-}-$stamp" \
+        --tag project=solweig-bench \
+        --file bench --file solweig_gpu \
+        -- env PYTHONPATH=. python bench/bench.py \
+            --download --label "$vm" --print-json "${bench_args[@]}" \
+        >"$log" 2>&1; then
+        status=ok
+    else
+        status="failed (exit $?)"
+    fi
+    local out="bench_runs/results/${stamp}_${vm}.json"
+    if python3 - "$log" "$out" <<'PY' 2>/dev/null; then
+import base64, gzip, json, re, sys
+text = open(sys.argv[1], errors="replace").read()
+m = re.search(r"===BENCH_JSON_BEGIN===(.*?)===BENCH_JSON_END===", text, re.S)
+report = json.loads(gzip.decompress(base64.b64decode(re.sub(r"[^A-Za-z0-9+/=]", "", m.group(1)))))
+json.dump(report, open(sys.argv[2], "w"), indent=2)
+PY
+        echo "[coiled_bench] $vm: $status -> $out"
+    else
+        rm -f "$out"
+        echo "[coiled_bench] $vm: $status, no results (see $log)"
+    fi
+}
+
+for vm in "${vm_types[@]}"; do run_one "$vm" & done
+wait
