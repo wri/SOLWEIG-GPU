@@ -9,6 +9,8 @@
 # Needs the software environment from bench/coiled-env.yml (see bench/README.md).
 # Set COILED_WORKSPACE in bench/.env (copy bench/.env.example) or the environment.
 # Set SOFTWARE to override the Coiled software environment.
+# If BENCH_S3_URI is set (in bench/.env), each results JSON is also uploaded to S3
+# with bench/upload_results.sh.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -56,6 +58,10 @@ report = json.loads(gzip.decompress(base64.b64decode(re.sub(r"[^A-Za-z0-9+/=]", 
 json.dump(report, open(sys.argv[2], "w"), indent=2)
 PY
         echo "[coiled_bench] $vm: $status -> $out"
+        if [[ -n "${BENCH_S3_URI:-}" ]]; then
+            bench/upload_results.sh "$out" | sed "s/^/[coiled_bench] $vm: /" \
+                || echo "[coiled_bench] $vm: S3 upload failed; retry with bench/upload_results.sh $out"
+        fi
     else
         rm -f "$out"
         echo "[coiled_bench] $vm: $status, no results (see $log)"

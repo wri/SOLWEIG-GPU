@@ -83,6 +83,7 @@ Arguments after `--` are passed to `bench.py`; `--download` and `--label <vm typ
 added automatically. `bench/` and `solweig_gpu/` are uploaded to the VM, so the run uses
 your local checkout. Each VM prints its results JSON to its log, and the script saves it to
 `bench_runs/results/<stamp>_<vm type>.json` (full logs in `bench_runs/logs/`).
+If `BENCH_S3_URI` is set, it also uploads each results JSON to S3 (see below).
 
 Suggested comparisons, each changing one thing:
 
@@ -91,6 +92,21 @@ Suggested comparisons, each changing one thing:
 | `c7i.2xlarge` vs `c7i.8xlarge`             | How do the CPU stages scale with cores?         |
 | `g4dn.xlarge` vs `g6.xlarge` vs `g5.xlarge`| T4 vs L4 vs A10G, all with 4 vCPUs              |
 | `g5.xlarge` vs `g5.4xlarge`                | Same GPU, more CPU: do CPU stages hold it back? |
+
+## Sharing results on S3
+
+Set `BENCH_S3_URI` in `bench/.env` to an S3 folder (and `AWS_PROFILE` if your default
+credentials can't write to it). Then upload results with:
+
+```bash
+bench/upload_results.sh                                  # new or changed files in bench_runs/results/
+bench/upload_results.sh bench_runs/results/<file>.json   # specific files
+```
+
+Files go to `$BENCH_S3_URI/results/<file name>`. `coiled_bench.sh` uploads each run's
+results automatically when `BENCH_S3_URI` is set. The upload runs from your machine with the
+AWS CLI, so the Coiled VMs don't need write access to the bucket. The results include the
+machine's hostname.
 
 ## Looking inside a stage
 
