@@ -56,11 +56,18 @@ uv run --with "gdal==$(gdal-config --version)" bench/bench.py --download \
 
 ## Running on EC2 with Coiled
 
+Set your Coiled workspace in `bench/.env` (it is gitignored):
+
+```bash
+cp bench/.env.example bench/.env   # then edit COILED_WORKSPACE
+```
+
 Build the software environment once (conda-forge PyTorch with CUDA, GDAL, etc.; it also
 works on CPU-only instances):
 
 ```bash
-uvx coiled env create --workspace wri-cities-data --name solweig-bench \
+set -a; . bench/.env; set +a
+uvx coiled env create --workspace "$COILED_WORKSPACE" --name solweig-bench \
     --conda bench/coiled-env.yml --gpu-enabled
 ```
 
@@ -71,7 +78,7 @@ parallel, and each VM shuts down when its run finishes:
 bench/coiled_bench.sh g4dn.xlarge g6.xlarge c7i.2xlarge -- --crop 1000
 ```
 
-Runs go to the `wri-cities-data` workspace (override with `WORKSPACE=...`).
+Runs go to the workspace set by `COILED_WORKSPACE` in `bench/.env`.
 Arguments after `--` are passed to `bench.py`; `--download` and `--label <vm type>` are
 added automatically. `bench/` and `solweig_gpu/` are uploaded to the VM, so the run uses
 your local checkout. Each VM prints its results JSON to its log, and the script saves it to

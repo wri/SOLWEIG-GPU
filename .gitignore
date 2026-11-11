@@ -17,3 +17,4 @@ _to_delete/
 
 # Benchmark working files and results
 bench_runs/
+.env

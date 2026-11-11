@@ -7,12 +7,14 @@
 # Instance types go before `--`; everything after it is passed to bench.py.
 # Runs start in parallel, one VM each. Logs go to bench_runs/logs/.
 # Needs the software environment from bench/coiled-env.yml (see bench/README.md).
-# Set WORKSPACE or SOFTWARE to override the Coiled workspace / software environment.
+# Set COILED_WORKSPACE in bench/.env (copy bench/.env.example) or the environment.
+# Set SOFTWARE to override the Coiled software environment.
 set -euo pipefail
 
-SOFTWARE="${SOFTWARE:-solweig-bench}"
-WORKSPACE="${WORKSPACE:-wri-cities-data}"
 cd "$(dirname "$0")/.."
+if [[ -f bench/.env ]]; then set -a; . bench/.env; set +a; fi
+SOFTWARE="${SOFTWARE:-solweig-bench}"
+WORKSPACE="${COILED_WORKSPACE:?set COILED_WORKSPACE in bench/.env (see bench/.env.example)}"
 
 vm_types=()
 while [[ $# -gt 0 && "$1" != "--" ]]; do vm_types+=("$1"); shift; done
