@@ -7,12 +7,16 @@
 # Instance types go before `--`; everything after it is passed to bench.py.
 # Runs start in parallel, one VM each. Logs go to bench_runs/logs/.
 # Needs the software environment from bench/coiled-env.yml (see bench/README.md).
-# Set WORKSPACE or SOFTWARE to override the Coiled workspace / software environment.
+# Set COILED_WORKSPACE in bench/.env (copy bench/.env.example) or the environment.
+# Set SOFTWARE to override the Coiled software environment.
+# If BENCH_S3_URI is set (in bench/.env), each results JSON is also uploaded to S3
+# with bench/upload_results.sh, and the HTML pages are rebuilt once all runs finish.
 set -euo pipefail
 
-SOFTWARE="${SOFTWARE:-solweig-bench}"
-WORKSPACE="${WORKSPACE:-wri-cities-data}"
 cd "$(dirname "$0")/.."
+if [[ -f bench/.env ]]; then set -a; . bench/.env; set +a; fi
+SOFTWARE="${SOFTWARE:-solweig-bench}"
+WORKSPACE="${COILED_WORKSPACE:?set COILED_WORKSPACE in bench/.env (see bench/.env.example)}"
 
 vm_types=()
 while [[ $# -gt 0 && "$1" != "--" ]]; do vm_types+=("$1"); shift; done
@@ -54,6 +58,10 @@ report = json.loads(gzip.decompress(base64.b64decode(re.sub(r"[^A-Za-z0-9+/=]", 
 json.dump(report, open(sys.argv[2], "w"), indent=2)
 PY
         echo "[coiled_bench] $vm: $status -> $out"
+        if [[ -n "${BENCH_S3_URI:-}" ]]; then
+            bench/upload_results.sh --no-report "$out" | sed "s/^/[coiled_bench] $vm: /" \
+                || echo "[coiled_bench] $vm: S3 upload failed; retry with bench/upload_results.sh $out"
+        fi
     else
         rm -f "$out"
         echo "[coiled_bench] $vm: $status, no results (see $log)"
@@ -62,3 +70,7 @@ PY
 
 for vm in "${vm_types[@]}"; do run_one "$vm" & done
 wait
+
+if [[ -n "${BENCH_S3_URI:-}" ]]; then
+    bench/publish_report.sh || echo "[coiled_bench] report not rebuilt; retry with bench/publish_report.sh"
+fi

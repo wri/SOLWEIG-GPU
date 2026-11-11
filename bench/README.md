@@ -56,11 +56,18 @@ uv run --with "gdal==$(gdal-config --version)" bench/bench.py --download \
 
 ## Running on EC2 with Coiled
 
+Set your Coiled workspace in `bench/.env` (it is gitignored):
+
+```bash
+cp bench/.env.example bench/.env   # then edit COILED_WORKSPACE
+```
+
 Build the software environment once (conda-forge PyTorch with CUDA, GDAL, etc.; it also
 works on CPU-only instances):
 
 ```bash
-uvx coiled env create --workspace wri-cities-data --name solweig-bench \
+set -a; . bench/.env; set +a
+uvx coiled env create --workspace "$COILED_WORKSPACE" --name solweig-bench \
     --conda bench/coiled-env.yml --gpu-enabled
 ```
 
@@ -71,11 +78,12 @@ parallel, and each VM shuts down when its run finishes:
 bench/coiled_bench.sh g4dn.xlarge g6.xlarge c7i.2xlarge -- --crop 1000
 ```
 
-Runs go to the `wri-cities-data` workspace (override with `WORKSPACE=...`).
+Runs go to the workspace set by `COILED_WORKSPACE` in `bench/.env`.
 Arguments after `--` are passed to `bench.py`; `--download` and `--label <vm type>` are
 added automatically. `bench/` and `solweig_gpu/` are uploaded to the VM, so the run uses
 your local checkout. Each VM prints its results JSON to its log, and the script saves it to
 `bench_runs/results/<stamp>_<vm type>.json` (full logs in `bench_runs/logs/`).
+If `BENCH_S3_URI` is set, it also uploads each results JSON to S3 (see below).
 
 Suggested comparisons, each changing one thing:
 
@@ -84,6 +92,36 @@ Suggested comparisons, each changing one thing:
 | `c7i.2xlarge` vs `c7i.8xlarge`             | How do the CPU stages scale with cores?         |
 | `g4dn.xlarge` vs `g6.xlarge` vs `g5.xlarge`| T4 vs L4 vs A10G, all with 4 vCPUs              |
 | `g5.xlarge` vs `g5.4xlarge`                | Same GPU, more CPU: do CPU stages hold it back? |
+
+## Sharing results on S3
+
+Set `BENCH_S3_URI` in `bench/.env` to an S3 folder (and `AWS_PROFILE` if your default
+credentials can't write to it). Then upload results with:
+
+```bash
+bench/upload_results.sh                                  # new or changed files in bench_runs/results/
+bench/upload_results.sh bench_runs/results/<file>.json   # specific files
+```
+
+Files go to `$BENCH_S3_URI/results/<file name>`. `coiled_bench.sh` uploads each run's
+results automatically when `BENCH_S3_URI` is set. The upload runs from your machine with the
+AWS CLI, so the Coiled VMs don't need write access to the bucket. The results include the
+machine's hostname.
+
+After uploading, `upload_results.sh` rebuilds a set of HTML pages from everything under
+`BENCH_S3_URI` (pass `--no-report` to skip this; `coiled_bench.sh` rebuilds once after all its
+runs finish):
+
+| Page | Contents |
+|------|----------|
+| `index.html` | All runs: time per stage (chart and table), compute cost, GPU use; links to findings |
+| `runs/<run>.html` | One run: stage table, CPU/GPU use over time, configuration, machine |
+| `findings/<topic>/<name>.html` | Each `findings/<topic>/<name>.md` on S3, rendered |
+
+To rebuild the pages without uploading anything, run `bench/publish_report.sh`; to build
+them locally, `uv run bench/report.py SRC_DIR OUT_DIR` (see the script for the layout).
+The pages have no scripts or external assets, so they work wherever the files are served,
+for example straight from a publicly readable bucket.
 
 ## Looking inside a stage
 
