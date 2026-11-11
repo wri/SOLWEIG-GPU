@@ -10,7 +10,7 @@
 # Set COILED_WORKSPACE in bench/.env (copy bench/.env.example) or the environment.
 # Set SOFTWARE to override the Coiled software environment.
 # If BENCH_S3_URI is set (in bench/.env), each results JSON is also uploaded to S3
-# with bench/upload_results.sh.
+# with bench/upload_results.sh, and the HTML pages are rebuilt once all runs finish.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -59,7 +59,7 @@ json.dump(report, open(sys.argv[2], "w"), indent=2)
 PY
         echo "[coiled_bench] $vm: $status -> $out"
         if [[ -n "${BENCH_S3_URI:-}" ]]; then
-            bench/upload_results.sh "$out" | sed "s/^/[coiled_bench] $vm: /" \
+            bench/upload_results.sh --no-report "$out" | sed "s/^/[coiled_bench] $vm: /" \
                 || echo "[coiled_bench] $vm: S3 upload failed; retry with bench/upload_results.sh $out"
         fi
     else
@@ -70,3 +70,7 @@ PY
 
 for vm in "${vm_types[@]}"; do run_one "$vm" & done
 wait
+
+if [[ -n "${BENCH_S3_URI:-}" ]]; then
+    bench/publish_report.sh || echo "[coiled_bench] report not rebuilt; retry with bench/publish_report.sh"
+fi

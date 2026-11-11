@@ -108,6 +108,21 @@ results automatically when `BENCH_S3_URI` is set. The upload runs from your mach
 AWS CLI, so the Coiled VMs don't need write access to the bucket. The results include the
 machine's hostname.
 
+After uploading, `upload_results.sh` rebuilds a set of HTML pages from everything under
+`BENCH_S3_URI` (pass `--no-report` to skip this; `coiled_bench.sh` rebuilds once after all its
+runs finish):
+
+| Page | Contents |
+|------|----------|
+| `index.html` | All runs: time per stage (chart and table), compute cost, GPU use; links to findings |
+| `runs/<run>.html` | One run: stage table, CPU/GPU use over time, configuration, machine |
+| `findings/<topic>/<name>.html` | Each `findings/<topic>/<name>.md` on S3, rendered |
+
+To rebuild the pages without uploading anything, run `bench/publish_report.sh`; to build
+them locally, `uv run bench/report.py SRC_DIR OUT_DIR` (see the script for the layout).
+The pages have no scripts or external assets, so they work wherever the files are served,
+for example straight from a publicly readable bucket.
+
 ## Looking inside a stage
 
 The stage timings show *which* stage is slow on a platform; a profiler shows *why*.
